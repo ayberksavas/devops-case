@@ -1,0 +1,41 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Python
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+.mypy_cache
+.ruff_cache
+
+# Local env (only the example is safe to ship — but it doesn't belong in the runtime image either)
+.env
+.env.*
+!.env.example
+
+# Docs and meta (not needed in the runtime image)
+*.md
+LICENSE
+
+# Docker / compose (build context shouldn't include the recipe itself)
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# Editor / OS
+.vscode
+.idea
+*.swp
+*.swo
+.DS_Store
+
+# Credentials that must never leak into the image
+*.pem
+*.key

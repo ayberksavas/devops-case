@@ -1,0 +1,13 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: devops-case-app:local
+    container_name: devops-case-app
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      BUILD_SHA: "${BUILD_SHA:-local-dev}"
+    restart: unless-stopped
