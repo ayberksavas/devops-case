@@ -1,0 +1,26 @@
+Release: {{ .Release.Name }} ({{ .Chart.Name }}-{{ .Chart.Version }}, app {{ .Chart.AppVersion }})
+Namespace: {{ .Release.Namespace }}
+Replicas:  {{ .Values.replicaCount }}
+
+Check rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "app.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+{{- if .Values.ingress.enabled }}
+
+Ingress host(s):
+{{- range $h := .Values.ingress.hosts }}
+  http://{{ $h.host }}{{ (first $h.paths).path }}
+{{- end }}
+
+To reach it from outside the cluster on minikube:
+  # one option: add the host to /etc/hosts pointing at $(minikube ip)
+  echo "$(minikube ip) {{ (first .Values.ingress.hosts).host }}" | sudo tee -a /etc/hosts
+  curl http://{{ (first .Values.ingress.hosts).host }}/ping
+
+{{- else }}
+
+No ingress configured. Port-forward to test:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "app.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://localhost:8080/ping
+{{- end }}
