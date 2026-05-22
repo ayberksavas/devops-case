@@ -41,6 +41,11 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 8. **Web server**: gunicorn with 2 workers (entrypoint of the container). Flask dev server is not used in the image.
 9. **Repo name**: `devops-case` on GitHub under `ayberksavas` (public). Repo URL: `https://github.com/ayberksavas/devops-case`. Default branch `main`. Working with main + feature branches, conventional commits, squash-merge PRs.
 10. **Branch protection on `main`**: ruleset `protect-main` applied — require PR before merging, **0 required approvals** (solo project, GitHub blocks self-approval), require linear history, require status checks (no checks configured yet — to wire on Day 3). Force pushes and deletions off. Admin bypass left ON as an escape hatch.
+11. **Helm chart layout**: `charts/app/` (chart name `app`), scaffolded from `helm create` then trimmed (removed bundled `hpa.yaml`, `httproute.yaml`) and customized. Env overlays live at the chart root as `values-dev.yaml` / `values-prod.yaml`. Matches the PDF's example command shape and leaves room for a second chart later (e.g. observability stack on Day 4).
+12. **Image strategy for Day 2**: build inside minikube's Docker daemon on EC2 via `eval $(minikube docker-env)` with `imagePullPolicy: IfNotPresent`. No registry yet — GHCR push lands on Day 3 with the same tag scheme, so this stops being needed.
+13. **Dev/prod diff locked at two values**: `replicaCount` and `ingress.hosts[0].host`. Resources stay aligned because EC2 has only 4 GiB RAM and over-divergence at this scale would be theatrical. PDF checkpoint specifically asks for "different replica and host values" — anything more is polish.
+14. **Secret approach**: chart includes a Secret manifest with placeholder `DEMO_TOKEN` supplied at deploy time via `--set-string`. Not consumed by the app yet — demonstrates the wiring (Secret → `envFrom`) without inventing a fake feature, while ticking the PDF's task 2.1 list.
+15. **Bonus 2.5 skipped**: HPA / NetworkPolicy / PDB deferred. Core Day 2 flow worked cleanly without them; revisiting would have required additional templates and cluster verification for no functional gain on a single-node minikube.
 
 ---
 
@@ -58,8 +63,15 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 - ✅ **1.4** Unit tests — `test_app.py` (3 pytest tests covering `/ping`, `/healthz`, `/version`) + `requirements-dev.txt`. Merged via PR #1 (`test/add-unit-tests` → `main`). Local-only for now; will be wired into CI on Day 3.
 - ✅ **Day 1 checkpoint** — `docker build` / `docker run` / `curl /ping → pong`, clean git log (2 commits), no secrets in repo, non-root user proven, HEALTHCHECK healthy. Evidence in `daily-checkpoints/day1-checkpoint.pdf`.
 
-### Days 2–4
-- ⬜ Day 2 — Helm chart (Deployment/Service/Ingress/ConfigMap/Secret), values-dev/prod, probes, rollout/rollback
+### Day 2 — Kubernetes & Helm ✅ COMPLETE
+- ✅ **2.1** Helm chart at `charts/app/` with Deployment / Service / Ingress / ConfigMap / Secret. Scaffolded from `helm create`, trimmed and customized: probes on `/healthz`, pod + container security context (non-root uid 1000, drop ALL caps), `envFrom` wires ConfigMap (`BUILD_SHA`) + Secret (`DEMO_TOKEN`), checksum annotations roll pods on config change.
+- ✅ **2.2** Two env overlays: `values-dev.yaml` (1 replica, host `devops-case.dev.local`) and `values-prod.yaml` (2 replicas, host `devops-case.local`). `helm template` diff between them is exactly those two lines. Both deployed and verified on minikube — see checkpoint PDF.
+- ✅ **2.3** Liveness + readiness probes against `/healthz` with distinct timings (liveness 5s/10s, readiness 2s/5s); requests `cpu 100m / mem 128Mi`, limits `cpu 500m / mem 256Mi`. Rationale documented in README.
+- ✅ **2.4** Rollout/rollback exercised: built `devops-case-app:0.1.1`, `helm upgrade --set image.tag=0.1.1` rolled to revision 3, `helm rollback app` reverted to revision 2 (`helm history` shows rev 4 description `Rollback to 2`). `kubectl rollout status` reported success for both transitions.
+- ⏭ **2.5** Bonus (HPA / NetworkPolicy / PDB) intentionally skipped — see decision #15.
+- ✅ **Day 2 checkpoint** — five-page PDF at `daily-checkpoints/day2-checkpoint.pdf` covers dev install (1 pod, dev host, probes healthy), prod install (2 pods, prod host, deployment 2/2), container CPU/memory requests & limits applied on running pods, rollout to 0.1.1, rollback to 2.
+
+### Days 3–4
 - ⬜ Day 3 — GitHub Actions (lint/test/build/Trivy/GHCR push), OIDC→AWS, gitleaks, v0.1.0 release, auto-deploy on merge
 - ⬜ Day 4 — JSON logs, `/metrics`, kube-prometheus-stack, Grafana dashboard, alert rule, Terraform (Track A), RUNBOOK, SECURITY.md, ≥3 ADRs, architecture diagram
 
@@ -72,15 +84,32 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 ├── .github/
 │   ├── CODEOWNERS                 # * → @ayberksavas
 │   └── pull_request_template.md   # conventional commits checklist
+├── charts/
+│   └── app/                       # Helm chart for the service (Day 2)
+│       ├── Chart.yaml             # name app, version 0.1.0, appVersion 0.1.0
+│       ├── values.yaml            # prod-shaped defaults with inline rationale
+│       ├── values-dev.yaml        # dev overlay (replicas=1, dev host)
+│       ├── values-prod.yaml       # explicit prod overlay
+│       └── templates/
+│           ├── _helpers.tpl
+│           ├── configmap.yaml     # BUILD_SHA
+│           ├── deployment.yaml    # probes on /healthz, envFrom, security context
+│           ├── ingress.yaml       # nginx class
+│           ├── NOTES.txt
+│           ├── secret.yaml        # DEMO_TOKEN placeholder
+│           ├── service.yaml       # ClusterIP, 80 → 8080
+│           ├── serviceaccount.yaml
+│           └── tests/test-connection.yaml
 ├── daily-checkpoints/
 │   ├── day0-checkpoint.pdf        # EC2 + SG + tool versions evidence (redacted)
-│   └── day1-checkpoint.pdf        # docker build/run/curl + non-root + git log + secret scan
+│   ├── day1-checkpoint.pdf        # docker build/run/curl + non-root + git log + secret scan
+│   └── day2-checkpoint.pdf        # dev install, prod install, resources, rollout, rollback
 ├── .dockerignore
 ├── .env.example                   # PORT, BUILD_SHA
 ├── .gitignore                     # python, secrets, macOS, IDE, .env (keeps .env.example)
 ├── Dockerfile                     # multi-stage, python:3.12-slim, non-root, HEALTHCHECK
 ├── PROGRESS.md                    # This file
-├── README.md                      # setup, run, container details, decisions
+├── README.md                      # setup, run, container, helm, decisions
 ├── SETUP.md                       # Day 0 infra log
 ├── app.py                         # Flask: /ping, /healthz, /version
 ├── docker-compose.yaml            # local-dev convenience
@@ -97,13 +126,16 @@ ssh -i devops-case.pem ubuntu@<elastic-ip>
 
 The `.pem` lives outside this directory (don't commit). Elastic IP is in the AWS console.
 
-### Git state (end of Day 1)
-- Branch: `main`
-- Commits:
+### Git state (Day 2 — `feat/day2-helm-chart`, PR open)
+- Active branch: `feat/day2-helm-chart`
+- Commits on the branch (will squash-merge into `main` as one Day 2 commit):
+  - **Commit 1** — `feat: add helm chart with dev/prod overlays` (chart files only)
+  - **Commit 2** — `docs: document Day 2 chart usage` (this README/PROGRESS update)
+  - **Commit 3** — `docs: add Day 2 checkpoint` (`daily-checkpoints/day2-checkpoint.pdf`)
+- `main` history (unchanged since Day 1):
   - `329a4d7` — `test: add unit tests for /ping, /healthz, /version (#1)`
   - `ef40631` — `Initial commit`
-- Branch protection active on `main` (ruleset `protect-main`)
-- Last PR merged: #1 (`test/add-unit-tests`, squash + delete branch)
+- Branch protection still active on `main` (ruleset `protect-main`); PR review + squash-merge required.
 
 ---
 
