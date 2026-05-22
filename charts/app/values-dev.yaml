@@ -1,0 +1,13 @@
+# Development overlay.
+# Differences from values.yaml: lower replica count and a dev-specific ingress host.
+# Other settings (resources, probes, security context) intentionally match prod so
+# we exercise the same shape in both environments.
+
+replicaCount: 1
+
+ingress:
+  hosts:
+    - host: devops-case.dev.local
+      paths:
+        - path: /
+          pathType: Prefix

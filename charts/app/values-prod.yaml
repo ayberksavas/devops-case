@@ -1,0 +1,12 @@
+# Production overlay.
+# Restated explicitly (even though some values match the chart defaults) so that this
+# file alone tells you what prod looks like, without having to cross-reference values.yaml.
+
+replicaCount: 2
+
+ingress:
+  hosts:
+    - host: devops-case.local
+      paths:
+        - path: /
+          pathType: Prefix

@@ -1,0 +1,112 @@
+# Default values for the `app` chart.
+# These defaults are prod-shaped. values-dev.yaml overrides the dev-specific bits;
+# values-prod.yaml restates the prod values explicitly so both env files are self-describing.
+
+replicaCount: 2
+
+image:
+  # Image built inside minikube's Docker daemon on the cluster host for Day 2
+  # (Day 3 will switch to a GHCR-hosted image with the same tag scheme).
+  repository: devops-case-app
+  tag: ""          # falls back to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod-level security: matches the non-root user baked into the Dockerfile (uid 1000).
+# Setting this at the orchestrator layer means k8s will refuse to start the pod if
+# someone later swaps in a root-running image by mistake.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80          # service-level (cluster-internal)
+  targetPort: 8080  # container listens here (matches Dockerfile EXPOSE and gunicorn bind)
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {}
+  hosts:
+    - host: devops-case.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Non-secret config injected as env vars via a ConfigMap.
+config:
+  # BUILD_SHA is rendered by /version. Set at deploy time:
+  #   helm upgrade ... --set config.BUILD_SHA=$(git rev-parse --short HEAD)
+  BUILD_SHA: "dev"
+
+# Secret env vars. Values supplied at deploy time, never committed:
+#   helm upgrade ... --set-string secret.DEMO_TOKEN=$(openssl rand -hex 16)
+# DEMO_TOKEN is a placeholder demonstrating the wiring; the app does not consume it yet.
+secret:
+  DEMO_TOKEN: ""
+
+# Resources tuned for a Flask + gunicorn (2 workers) container at low traffic.
+# Rationale (see README): requests cover steady-state idle; limits give ~5x burst
+# headroom on CPU so a brief request flood doesn't get CPU-throttled, while memory
+# limit is ~2x requests because python worker memory stays roughly stable.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Both probes hit /healthz (the app's existing endpoint).
+# Liveness restarts the container if it stops responding.
+# Readiness pulls the pod out of the Service endpoints during gunicorn startup
+# or transient errors, without killing the container.
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 5
+  timeoutSeconds: 2
+  failureThreshold: 2
+
+# HPA is a Day 2 bonus task; left off for now (see ADR on Day 4).
+autoscaling:
+  enabled: false
+
+volumes: []
+volumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

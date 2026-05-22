@@ -1,0 +1,8 @@
+apiVersion: v2
+name: app
+description: Helm chart for the devops-case Flask service (/ping, /healthz, /version).
+type: application
+# Chart version: bump when chart templates change.
+version: 0.1.0
+# App version: matches the container image tag.
+appVersion: "0.1.0"
