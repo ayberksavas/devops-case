@@ -285,6 +285,34 @@ gh variable set AWS_REGION   --body "eu-north-1"
 
 The chart's `appVersion`, the git tag, and the published image tag should all stay aligned.
 
+### Auto-deploy on merge
+
+A push to `main` that passes `build, scan, push` is then auto-deployed to the minikube cluster on EC2 by the `deploy (ssm → ec2 → helm)` job. Mechanism:
+
+1. The workflow assumes the same OIDC role from 3.2 — now extended with an inline `DeployViaSSM` policy granting `ssm:SendCommand` scoped to one document (`AWS-RunShellScript`) and one instance (the EC2 host).
+2. `aws ssm send-command` invokes a shell script on the EC2 instance as the `ubuntu` user. The command line is small: `cd /opt/devops-case && git fetch && git reset --hard origin/main && bash scripts/deploy.sh <short-sha>`.
+3. [`scripts/deploy.sh`](./scripts/deploy.sh) runs `helm upgrade --install` with `--set image.tag=<short-sha>` and `--set config.BUILD_SHA=<short-sha>` so `/version` reports the deployed SHA, then waits for `kubectl rollout status`.
+4. The workflow polls with `aws ssm wait command-executed`, then always prints the captured stdout/stderr (so failed deploys are debuggable).
+
+**Why this shape (vs ArgoCD/Flux GitOps):**
+
+| | CI push via OIDC + SSM (chosen) | ArgoCD/Flux |
+|---|---|---|
+| Extra cluster components | none | ~500 MiB on the 4 GiB EC2 |
+| Reuses what we built | yes — extends the OIDC role | no — net new control plane |
+| Feedback latency | merge → ~30s | merge → next sync cycle |
+| Rollback model | imperative (`helm rollback`) | declarative (revert the commit) |
+| Right shape at this scale | ✅ one app, one node | overkill |
+
+GitOps becomes the right answer in a multi-app, multi-team context. For one Flask app on a single-node minikube with the OIDC machinery already in place, the CI-push path is the simpler, less wasteful pick.
+
+**One-time AWS-side prerequisites** (done manually for now; Day 4 IaC will codify it):
+
+- EC2 instance profile `devops-case-ec2-ssm` attached to the instance, with the AWS-managed `AmazonSSMManagedInstanceCore` policy — lets the SSM agent register the instance.
+- Inline policy `DeployViaSSM` attached to the OIDC role with `ssm:SendCommand` (scoped to `AWS-RunShellScript` + the instance ARN) and `ssm:GetCommandInvocation`.
+- Repo variables: `EC2_INSTANCE_ID` (in addition to `AWS_ROLE_ARN`, `AWS_REGION` from 3.2).
+- The repo is cloned once at `/opt/devops-case` on EC2, owned by `ubuntu`. Subsequent deploys `git fetch && reset --hard origin/main`.
+
 ## Project status
 
 See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progress.
@@ -299,6 +327,8 @@ See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progres
 - **Why install gitleaks and trivy binaries directly (not via wrapper actions)**: see the [CI/CD — Secret & vulnerability scanning](#secret--vulnerability-scanning) section. Short version: gitleaks-action needs `GITLEAKS_LICENSE` for orgs, and trivy-action's internal sparse-checkout flakes on hosted runners. Binary install dodges both.
 - **Why repo *variables* for AWS OIDC config (not secrets)**: `AWS_ROLE_ARN` and `AWS_REGION` are identifiers, not credential material. The entire point of OIDC is that no credential lives in repo storage — using "secrets" would falsely imply there's something to protect.
 - **Why `:latest` tracks releases, not `main`**: registry convention is that `:latest` means "latest released version", not "latest commit". Main commits are addressable via `:main` and `:<short-sha>`. Setting `:latest` only on `github.ref_type == 'tag'` enforces the convention.
+- **Why CI-push deploy via SSM (not ArgoCD/Flux GitOps)**: see the [Auto-deploy on merge](#auto-deploy-on-merge) table. Short version: we already built the OIDC machinery for 3.2, so deploy adds one IAM policy + one workflow job. ArgoCD is the right answer at multi-app multi-team scale; here it would add ~500 MiB on a 4 GiB EC2 plus a control plane to manage, for marginal benefit on one Flask app.
+- **Why the EC2 holds a checkout of the repo at `/opt/devops-case`** (instead of CI rendering manifests and shipping them via SSM): rendered Helm output is bigger than the 4 KiB SSM inline-command limit. The alternatives are an S3 hop or compressing the YAML, both of which add moving parts. A `git fetch && reset --hard origin/main` on the EC2 is one network round-trip and keeps the deploy script tiny.
 
 Full ADRs land on Day 4 under `docs/adr/`.
 
