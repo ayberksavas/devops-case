@@ -88,16 +88,23 @@ jobs:
           cache-to: type=gha,mode=max
 
       # Fail on CRITICAL/HIGH so a vulnerable image never reaches GHCR.
-      # ignore-unfixed skips findings with no upstream fix available
+      # --ignore-unfixed skips findings with no upstream fix available
       # (otherwise base-image noise can hold up releases for no actionable reason).
+      #
+      # Using setup-trivy + plain `trivy` invocation instead of trivy-action
+      # because v0.36.0 of the wrapper action has a broken internal sparse-checkout
+      # of the trivy repo that fails on hosted runners ("could not read Username").
+      - name: install trivy
+        uses: aquasecurity/setup-trivy@v0.2.6
+
       - name: scan (trivy)
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
-          severity: CRITICAL,HIGH
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: os,library
+        run: |
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --pkg-types os,library \
+            --exit-code 1 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
 
       - name: login to GHCR
         if: github.event_name != 'pull_request'
