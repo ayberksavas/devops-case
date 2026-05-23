@@ -75,6 +75,25 @@ jobs:
       - name: scan
         run: gitleaks detect --source . --no-banner --verbose --redact
 
+  # Proves the GitHub <-> AWS OIDC trust works end-to-end on every run.
+  # No long-lived AWS keys involved: GitHub mints a short-lived OIDC token,
+  # AWS exchanges it for temporary credentials via sts:AssumeRoleWithWebIdentity.
+  # The role itself has no permission policies attached yet — sts:GetCallerIdentity
+  # works without any. Day 3.4 will add ssm:SendCommand for auto-deploy.
+  # Not in `build.needs:` because OIDC is informational, not a security gate.
+  aws-oidc:
+    name: aws OIDC (whoami)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write     # required for GitHub to mint the OIDC token
+      contents: read      # default for checkout-less jobs; explicit for clarity
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6.1.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: aws sts get-caller-identity
+
   build:
     name: build, scan, push
     needs: [lint, test, gitleaks]
