@@ -46,6 +46,16 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 13. **Dev/prod diff locked at two values**: `replicaCount` and `ingress.hosts[0].host`. Resources stay aligned because EC2 has only 4 GiB RAM and over-divergence at this scale would be theatrical. PDF checkpoint specifically asks for "different replica and host values" — anything more is polish.
 14. **Secret approach**: chart includes a Secret manifest with placeholder `DEMO_TOKEN` supplied at deploy time via `--set-string`. Not consumed by the app yet — demonstrates the wiring (Secret → `envFrom`) without inventing a fake feature, while ticking the PDF's task 2.1 list.
 15. **Bonus 2.5 skipped**: HPA / NetworkPolicy / PDB deferred. Core Day 2 flow worked cleanly without them; revisiting would have required additional templates and cluster verification for no functional gain on a single-node minikube.
+16. **Linter: ruff** over flake8 + black. Single binary, ~100× faster, sensible zero-config defaults. Config in `pyproject.toml` with rule set `E` (pycodestyle), `F` (pyflakes), `I` (isort), `B` (flake8-bugbear), `UP` (pyupgrade). `ruff format --check` not run yet — adds noise without value at this code size.
+17. **Direct binary install for gitleaks and trivy** instead of their wrapper actions. Two different causes converged on the same fix:
+    - `gitleaks/gitleaks-action@v2` requires a paid `GITLEAKS_LICENSE` env var for org accounts (personal accounts are free today, but the licensing model has wobbled).
+    - `aquasecurity/trivy-action` and `aquasecurity/setup-trivy` both do an internal sparse-checkout of `aquasecurity/trivy` with `--filter=blob:none`. The resulting promisor remote flakes intermittently on hosted runners with `could not read Username for 'https://github.com': terminal prompts disabled`. Confirmed by a green re-run of the same workflow with no code change.
+    Trade-off: versions are pinned in the workflow file (`GITLEAKS_VERSION=8.30.1`, `TRIVY_VERSION=0.70.0`) and must be bumped manually. Accepted because the pattern is consistent, ~5 lines, and avoids the flake entirely.
+18. **AWS region: `eu-north-1`** (Stockholm) — matches the EC2 region from Day 0. No multi-region setup planned.
+19. **OIDC role scope**: trust policy `sub` claim is `repo:ayberksavas/devops-case:*` (any branch/ref in this repo). Could tighten to `:ref:refs/heads/main` once 3.4 deploy lands, but the wildcard makes it easier to demo from PR runs too. No permission policies attached yet — `sts:GetCallerIdentity` works without any. Day 3.4 will add `ssm:SendCommand` scoped to the EC2 instance.
+20. **OIDC config via repo variables, not secrets**: `AWS_ROLE_ARN` and `AWS_REGION` are identifiers, not credentials. The entire point of OIDC is that no credential material lives in repo storage. Variables fit the semantics; secrets would falsely imply something to protect.
+21. **CHANGELOG format**: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — `[Unreleased]` placeholder + dated `[X.Y.Z]` sections. Chosen for tooling compatibility (release-please etc. can parse it) and because it's the obvious standard.
+22. **`:latest` tracks releases, not `main`**: metadata-action enables `:latest` only on `github.ref_type == 'tag'`. Registry convention is that `:latest` means "latest released version", not "latest commit". Main commits get pinned via `:main` and `:<short-sha>` instead.
 
 ---
 
@@ -71,9 +81,21 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 - ⏭ **2.5** Bonus (HPA / NetworkPolicy / PDB) intentionally skipped — see decision #15.
 - ✅ **Day 2 checkpoint** — five-page PDF at `daily-checkpoints/day2-checkpoint.pdf` covers dev install (1 pod, dev host, probes healthy), prod install (2 pods, prod host, deployment 2/2), container CPU/memory requests & limits applied on running pods, rollout to 0.1.1, rollback to 2.
 
-### Days 3–4
-- ⬜ Day 3 — GitHub Actions (lint/test/build/Trivy/GHCR push), OIDC→AWS, gitleaks, v0.1.0 release, auto-deploy on merge
-- ⬜ Day 4 — JSON logs, `/metrics`, kube-prometheus-stack, Grafana dashboard, alert rule, Terraform (Track A), RUNBOOK, SECURITY.md, ≥3 ADRs, architecture diagram
+### Day 3 — CI/CD & Supply chain 🔄 IN PROGRESS
+- ✅ **3.1** GitHub Actions pipeline at `.github/workflows/ci.yml` — jobs `lint (ruff)`, `test (pytest)`, `build, scan, push`. Triggers on PR, push to `main`, push to `v*` tags, and `workflow_dispatch`. `docker/metadata-action` produces `:<short-sha>` + `:main` on main push, `:<semver>` + `:latest` on tag push, `:pr-N` on PRs (built+scanned only, never pushed). Trivy gates push on CRITICAL/HIGH with `--ignore-unfixed`. Merged via PR #5.
+- ✅ **3.2** Secrets & auth — two PRs, both merged:
+  - **Gitleaks** (PR #6) — full-history scan (`fetch-depth: 0`) with `--redact` so any finding doesn't re-leak through the public Action log. Binary install (see decision #17).
+  - **AWS OIDC** (PR #7) — IAM OIDC identity provider for `token.actions.githubusercontent.com` created in account `809338888160` (eu-north-1). Role `github-actions-devops-case` with trust policy scoped to `repo:ayberksavas/devops-case:*` and no permission policies attached. Workflow's `aws OIDC (whoami)` job assumes the role and runs `aws sts get-caller-identity` on every event as a federation proof. Role ARN + region stored as repo *variables* (decision #20).
+- 🔄 **3.3** Release hygiene — in progress:
+  - ✅ `CHANGELOG.md` (Keep a Changelog format) added via PR #8.
+  - 🔄 Trivy install switched from `aquasecurity/setup-trivy@v0.2.6` to direct binary download (see decision #17 for the flake we hit). This PR.
+  - ⬜ Tag `v0.1.0` from `main` — tag push will fire the existing workflow's `type=semver` path and publish `:0.1.0` + `:latest` to GHCR.
+  - ⬜ Create GitHub Release from the tag, notes extracted from CHANGELOG.
+- ⬜ **3.4** Auto-deploy on merge — open architectural decision: `kubectl set image` via OIDC + SSM from CI, vs ArgoCD/Flux GitOps on cluster.
+- ⏭ **3.5** Bonus (cosign / SBOM / multi-arch / release-please) — deferred until 3.4 lands.
+
+### Day 4
+- ⬜ JSON logs, `/metrics`, kube-prometheus-stack, Grafana dashboard, alert rule, Terraform (Track A), RUNBOOK, SECURITY.md, ≥3 ADRs, architecture diagram
 
 ---
 
@@ -83,7 +105,9 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 /Users/ayberksavas/Desktop/devops-case/
 ├── .github/
 │   ├── CODEOWNERS                 # * → @ayberksavas
-│   └── pull_request_template.md   # conventional commits checklist
+│   ├── pull_request_template.md   # conventional commits checklist
+│   └── workflows/
+│       └── ci.yml                 # lint, test, gitleaks, AWS OIDC, build/scan/push (Day 3)
 ├── charts/
 │   └── app/                       # Helm chart for the service (Day 2)
 │       ├── Chart.yaml             # name app, version 0.1.0, appVersion 0.1.0
@@ -107,14 +131,16 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 ├── .dockerignore
 ├── .env.example                   # PORT, BUILD_SHA
 ├── .gitignore                     # python, secrets, macOS, IDE, .env (keeps .env.example)
+├── CHANGELOG.md                   # Keep a Changelog format; tracks v0.1.0+ (Day 3)
 ├── Dockerfile                     # multi-stage, python:3.12-slim, non-root, HEALTHCHECK
 ├── PROGRESS.md                    # This file
-├── README.md                      # setup, run, container, helm, decisions
+├── README.md                      # setup, run, container, helm, CI/CD, decisions
 ├── SETUP.md                       # Day 0 infra log
 ├── app.py                         # Flask: /ping, /healthz, /version
 ├── docker-compose.yaml            # local-dev convenience
+├── pyproject.toml                 # ruff config (Day 3)
 ├── requirements.txt               # flask==3.0.3, gunicorn==23.0.0
-├── requirements-dev.txt           # -r requirements.txt + pytest==8.3.3
+├── requirements-dev.txt           # -r requirements.txt + pytest==8.3.3, ruff==0.7.4
 ├── test_app.py                    # 3 pytest tests covering all endpoints
 └── .venv/                         # gitignored, local python env
 ```
@@ -126,24 +152,24 @@ ssh -i devops-case.pem ubuntu@<elastic-ip>
 
 The `.pem` lives outside this directory (don't commit). Elastic IP is in the AWS console.
 
-### Git state (Day 2 — `feat/day2-helm-chart`, PR open)
-- Active branch: `feat/day2-helm-chart`
-- Commits on the branch (will squash-merge into `main` as one Day 2 commit):
-  - **Commit 1** — `feat: add helm chart with dev/prod overlays` (chart files only)
-  - **Commit 2** — `docs: document Day 2 chart usage` (this README/PROGRESS update)
-  - **Commit 3** — `docs: add Day 2 checkpoint` (`daily-checkpoints/day2-checkpoint.pdf`)
-- `main` history (unchanged since Day 1):
-  - `329a4d7` — `test: add unit tests for /ping, /healthz, /version (#1)`
-  - `ef40631` — `Initial commit`
-- Branch protection still active on `main` (ruleset `protect-main`); PR review + squash-merge required.
+### Git state (Day 3 — release prep)
+- `main` history through Day 3:
+  - `#5` — `ci: add GitHub Actions pipeline (lint, test, Trivy scan, GHCR push)` (3.1)
+  - `#6` — `ci: add gitleaks secret scan job` (3.2 secrets)
+  - `#7` — `ci: add AWS OIDC whoami job (no long-lived keys)` (3.2 OIDC)
+  - `#8` — `docs: add CHANGELOG for v0.1.0` (3.3, release-notes only)
+- Open work: trivy binary-install fix + this README/PROGRESS docs update (current PR).
+- After this merges: tag `v0.1.0` from `main`, create GitHub Release.
+- Branch protection on `main` (`protect-main` ruleset) — required status checks: `lint (ruff)`, `test (pytest)`, `gitleaks (secret scan)`, `build, scan, push` (wired after first green run on `main`).
 
 ---
 
 ## Open questions / unresolved
 
-- Auto-deploy mechanism for Day 3.4: `kubectl set image` from CI vs ArgoCD GitOps. Decide at Day 3.
-- Bonus picks at Day 2.5 (HPA / NetworkPolicy / PDB) and Day 3.5 (cosign / SBOM / multi-arch) — defer until core flow works.
-- Image size optimisation (slim → distroless) — documented upgrade path; revisit if Trivy gets noisy on Day 3.
+- **Auto-deploy mechanism for Day 3.4**: `kubectl set image` via OIDC + SSM from CI vs ArgoCD/Flux GitOps on cluster. Decide when starting 3.4.
+- **Day 3.5 bonus picks** (cosign / SBOM / multi-arch / release-please) — defer until 3.4 lands.
+- **Image size optimisation (slim → distroless)** — documented upgrade path. Not needed in practice: first Trivy run came back clean at CRITICAL/HIGH with `--ignore-unfixed`, so `python:3.12-slim` is fine for now.
+- **OIDC trust scope tightening** — currently any ref in the repo can assume the role (`repo:ayberksavas/devops-case:*`). Could tighten to `:ref:refs/heads/main` after 3.4 wires deploy, but keep wildcard while OIDC is still demo-only.
 
 ---
 
