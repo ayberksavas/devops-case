@@ -56,6 +56,8 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 20. **OIDC config via repo variables, not secrets**: `AWS_ROLE_ARN` and `AWS_REGION` are identifiers, not credentials. The entire point of OIDC is that no credential material lives in repo storage. Variables fit the semantics; secrets would falsely imply something to protect.
 21. **CHANGELOG format**: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — `[Unreleased]` placeholder + dated `[X.Y.Z]` sections. Chosen for tooling compatibility (release-please etc. can parse it) and because it's the obvious standard.
 22. **`:latest` tracks releases, not `main`**: metadata-action enables `:latest` only on `github.ref_type == 'tag'`. Registry convention is that `:latest` means "latest released version", not "latest commit". Main commits get pinned via `:main` and `:<short-sha>` instead.
+23. **Auto-deploy via CI push (OIDC + SSM), not GitOps**: chose `kubectl set image` flavor — specifically `aws ssm send-command` invoking `bash scripts/deploy.sh <sha>` on the EC2 instance — over ArgoCD/Flux. Rationale: extends the existing OIDC role with one inline IAM policy and adds one workflow job; ArgoCD would add a ~500 MiB control plane on the 4 GiB EC2 plus an `Application` CR for marginal benefit on a single-node single-app cluster. GitOps is the right answer at multi-app multi-team scale; here it would be ceremony.
+24. **EC2 holds a checkout of the repo at `/opt/devops-case`** (owned by `ubuntu`) rather than having CI render manifests and ship them via SSM. Reason: rendered Helm output is larger than the 4 KiB SSM inline-command limit, and the alternatives (S3 hop, base64-compressed YAML, etc.) add moving parts. A `git fetch && reset --hard origin/main` on the instance is one network round-trip and keeps the deploy script tiny. Trade-off: the cluster host needs git connectivity to GitHub (already does for `git pull` to work), and the repo is duplicated between CI runner and EC2.
 
 ---
 
@@ -81,18 +83,14 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 - ⏭ **2.5** Bonus (HPA / NetworkPolicy / PDB) intentionally skipped — see decision #15.
 - ✅ **Day 2 checkpoint** — five-page PDF at `daily-checkpoints/day2-checkpoint.pdf` covers dev install (1 pod, dev host, probes healthy), prod install (2 pods, prod host, deployment 2/2), container CPU/memory requests & limits applied on running pods, rollout to 0.1.1, rollback to 2.
 
-### Day 3 — CI/CD & Supply chain 🔄 IN PROGRESS
+### Day 3 — CI/CD & Supply chain ✅ COMPLETE
 - ✅ **3.1** GitHub Actions pipeline at `.github/workflows/ci.yml` — jobs `lint (ruff)`, `test (pytest)`, `build, scan, push`. Triggers on PR, push to `main`, push to `v*` tags, and `workflow_dispatch`. `docker/metadata-action` produces `:<short-sha>` + `:main` on main push, `:<semver>` + `:latest` on tag push, `:pr-N` on PRs (built+scanned only, never pushed). Trivy gates push on CRITICAL/HIGH with `--ignore-unfixed`. Merged via PR #5.
 - ✅ **3.2** Secrets & auth — two PRs, both merged:
   - **Gitleaks** (PR #6) — full-history scan (`fetch-depth: 0`) with `--redact` so any finding doesn't re-leak through the public Action log. Binary install (see decision #17).
   - **AWS OIDC** (PR #7) — IAM OIDC identity provider for `token.actions.githubusercontent.com` created in account `809338888160` (eu-north-1). Role `github-actions-devops-case` with trust policy scoped to `repo:ayberksavas/devops-case:*` and no permission policies attached. Workflow's `aws OIDC (whoami)` job assumes the role and runs `aws sts get-caller-identity` on every event as a federation proof. Role ARN + region stored as repo *variables* (decision #20).
-- 🔄 **3.3** Release hygiene — in progress:
-  - ✅ `CHANGELOG.md` (Keep a Changelog format) added via PR #8.
-  - 🔄 Trivy install switched from `aquasecurity/setup-trivy@v0.2.6` to direct binary download (see decision #17 for the flake we hit). This PR.
-  - ⬜ Tag `v0.1.0` from `main` — tag push will fire the existing workflow's `type=semver` path and publish `:0.1.0` + `:latest` to GHCR.
-  - ⬜ Create GitHub Release from the tag, notes extracted from CHANGELOG.
-- ⬜ **3.4** Auto-deploy on merge — open architectural decision: `kubectl set image` via OIDC + SSM from CI, vs ArgoCD/Flux GitOps on cluster.
-- ⏭ **3.5** Bonus (cosign / SBOM / multi-arch / release-please) — deferred until 3.4 lands.
+- ✅ **3.3** Release hygiene — `CHANGELOG.md` (Keep a Changelog) merged via PR #8. Trivy install switched from `aquasecurity/setup-trivy@v0.2.6` to direct binary download (decision #17) — merged via the trivy-fix + docs PR. Tag `v0.1.0` pushed from `main`; CI auto-published `:0.1.0` + `:latest` to GHCR; GitHub Release page exists at `releases/tag/v0.1.0` with notes extracted from CHANGELOG. Chart `appVersion`, git tag, and image tag all aligned.
+- ✅ **3.4** Auto-deploy on merge — chose CI-push via OIDC + SSM (decision #23). Extended OIDC role with inline `DeployViaSSM` policy (decision #24). EC2 got an `AmazonSSMManagedInstanceCore` instance profile and an `ubuntu`-owned `/opt/devops-case` checkout. New `deploy (ssm → ec2 → helm)` job in `ci.yml` invokes `scripts/deploy.sh` on the instance via `aws ssm send-command` after every successful main-branch build. Stdout/stderr captured and printed in the workflow log.
+- ⏭ **3.5** Bonus (cosign / SBOM / multi-arch / release-please) — intentionally skipped. Day 4 has its own scope (observability + IaC + docs) and consumed bonus would push core work to overflow.
 
 ### Day 4
 - ⬜ JSON logs, `/metrics`, kube-prometheus-stack, Grafana dashboard, alert rule, Terraform (Track A), RUNBOOK, SECURITY.md, ≥3 ADRs, architecture diagram
@@ -141,6 +139,8 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 ├── pyproject.toml                 # ruff config (Day 3)
 ├── requirements.txt               # flask==3.0.3, gunicorn==23.0.0
 ├── requirements-dev.txt           # -r requirements.txt + pytest==8.3.3, ruff==0.7.4
+├── scripts/
+│   └── deploy.sh                  # runs on EC2 via SSM after main merge (Day 3.4)
 ├── test_app.py                    # 3 pytest tests covering all endpoints
 └── .venv/                         # gitignored, local python env
 ```
@@ -152,24 +152,24 @@ ssh -i devops-case.pem ubuntu@<elastic-ip>
 
 The `.pem` lives outside this directory (don't commit). Elastic IP is in the AWS console.
 
-### Git state (Day 3 — release prep)
-- `main` history through Day 3:
+### Git state (end of Day 3)
+- `main` history through Day 3 (PR numbers):
   - `#5` — `ci: add GitHub Actions pipeline (lint, test, Trivy scan, GHCR push)` (3.1)
   - `#6` — `ci: add gitleaks secret scan job` (3.2 secrets)
   - `#7` — `ci: add AWS OIDC whoami job (no long-lived keys)` (3.2 OIDC)
-  - `#8` — `docs: add CHANGELOG for v0.1.0` (3.3, release-notes only)
-- Open work: trivy binary-install fix + this README/PROGRESS docs update (current PR).
-- After this merges: tag `v0.1.0` from `main`, create GitHub Release.
+  - `#8` — `docs: add CHANGELOG for v0.1.0` (3.3, release notes)
+  - `#9` — `chore: fix flaky trivy install + document Day 3 in README and PROGRESS` (trivy binary install + first batch of Day 3 docs)
+  - `#10` (this PR) — `feat: auto-deploy to minikube via OIDC + SSM after merge` (3.4)
+- Tags: `v0.1.0` cut after #9 merged; CI auto-published `ghcr.io/ayberksavas/devops-case-app:0.1.0` and `:latest`. GitHub Release page at `releases/tag/v0.1.0`.
 - Branch protection on `main` (`protect-main` ruleset) — required status checks: `lint (ruff)`, `test (pytest)`, `gitleaks (secret scan)`, `build, scan, push` (wired after first green run on `main`).
 
 ---
 
 ## Open questions / unresolved
 
-- **Auto-deploy mechanism for Day 3.4**: `kubectl set image` via OIDC + SSM from CI vs ArgoCD/Flux GitOps on cluster. Decide when starting 3.4.
-- **Day 3.5 bonus picks** (cosign / SBOM / multi-arch / release-please) — defer until 3.4 lands.
-- **Image size optimisation (slim → distroless)** — documented upgrade path. Not needed in practice: first Trivy run came back clean at CRITICAL/HIGH with `--ignore-unfixed`, so `python:3.12-slim` is fine for now.
-- **OIDC trust scope tightening** — currently any ref in the repo can assume the role (`repo:ayberksavas/devops-case:*`). Could tighten to `:ref:refs/heads/main` after 3.4 wires deploy, but keep wildcard while OIDC is still demo-only.
+- **Image size optimisation (slim → distroless)** — documented upgrade path. Not needed in practice: Trivy is clean at CRITICAL/HIGH with `--ignore-unfixed`, so `python:3.12-slim` is fine for now.
+- **OIDC trust scope tightening** — currently any ref in the repo can assume the role (`repo:ayberksavas/devops-case:*`). Now that 3.4 deploy is wired, could tighten to `:ref:refs/heads/main` for the deploy role. Keeping the wildcard for now so PR runs can still demo `aws sts get-caller-identity`.
+- **Day 4 Terraform scope** — at minimum the EC2 + EIP + SG (PDF asks for this). Could also pull in the OIDC provider, OIDC role, EC2 instance profile, and the inline `DeployViaSSM` policy from Day 3 to fully codify the AWS surface. Decide at Day 4.
 
 ---
 
