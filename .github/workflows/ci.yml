@@ -133,11 +133,18 @@ jobs:
       # --ignore-unfixed skips findings with no upstream fix available
       # (otherwise base-image noise can hold up releases for no actionable reason).
       #
-      # Using setup-trivy + plain `trivy` invocation instead of trivy-action
-      # because v0.36.0 of the wrapper action has a broken internal sparse-checkout
-      # of the trivy repo that fails on hosted runners ("could not read Username").
+      # Install the binary directly (mirrors the gitleaks job pattern). The
+      # aquasecurity/trivy-action and aquasecurity/setup-trivy actions both do an
+      # internal sparse-checkout of the aquasecurity/trivy repo (for contrib/
+      # templates), which uses `--filter=blob:none` and a promisor remote. That
+      # lazy fetch intermittently fails on hosted runners with
+      # "could not read Username for https://github.com: terminal prompts disabled".
+      # Skipping the wrapper bypasses the flake entirely.
       - name: install trivy
-        uses: aquasecurity/setup-trivy@v0.2.6
+        run: |
+          TRIVY_VERSION=0.70.0
+          curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin trivy
 
       - name: scan (trivy)
         run: |
