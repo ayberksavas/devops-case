@@ -91,7 +91,7 @@ jobs:
       # ignore-unfixed skips findings with no upstream fix available
       # (otherwise base-image noise can hold up releases for no actionable reason).
       - name: scan (trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           severity: CRITICAL,HIGH
