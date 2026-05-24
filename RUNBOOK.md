@@ -236,6 +236,40 @@ operator's laptop).
 
 ## 5. Common failure modes
 
+### Public URL unreachable from outside (`curl http://<EIP>/ping` connection refused)
+
+The cluster is up, `curl $(minikube ip)/ping` works from EC2, but the
+Elastic IP doesn't serve. Cause: the host-level forwarder
+(`minikube-ingress-proxy` systemd unit) isn't running. With the
+docker driver, minikube doesn't bind to the host's port 80 — that's
+what the forwarder bridges.
+
+```bash
+# Quick status
+sudo systemctl status minikube-ingress-proxy --no-pager
+
+# If inactive / failed:
+sudo systemctl restart minikube-ingress-proxy
+sudo systemctl status minikube-ingress-proxy --no-pager
+
+# Tail logs if it keeps failing
+sudo journalctl -u minikube-ingress-proxy --no-pager | tail -30
+```
+
+Common reasons for failure after a fresh boot:
+
+- **`minikube` hasn't been started yet** — the forwarder's target
+  (`192.168.49.2:80`) isn't reachable, so `socat` retries every 10s
+  but can't connect. Fix: `minikube start`. Within seconds the
+  forwarder's next restart attempt succeeds.
+- **Minikube was deleted and recreated** — the IP may have drifted
+  from `192.168.49.2`. Check with `minikube ip` and update the
+  `ExecStart` line in `/etc/systemd/system/minikube-ingress-proxy.service`
+  if it changed (then `daemon-reload` + `restart`).
+
+See `SETUP.md` "Phase 4 — Host-level port forwarding" for the
+full rationale and the original unit definition.
+
 ### `helm upgrade` fails with `no matches for kind "ServiceMonitor"`
 
 The kube-prometheus-stack CRDs aren't installed yet. Install the stack

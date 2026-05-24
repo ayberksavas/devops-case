@@ -134,6 +134,17 @@ The diagram is rendered inline by GitHub. The blue nodes are the application
 observability overlay added on Day 4.2. Dashed arrows are *information flow*
 (scrape, envFrom, alerts, queries); solid arrows are *request flow*.
 
+> **One implementation detail not shown in the diagram for clarity:** with
+> minikube's docker driver, the cluster's ingress doesn't bind directly to
+> the EC2 host's port 80 — it listens inside the minikube docker network
+> (`192.168.49.2:80`). A host-level `socat` forwarder packaged as a
+> systemd unit (`minikube-ingress-proxy.service`) bridges `EC2:80` to
+> `192.168.49.2:80`, so the Elastic IP serves traffic as expected.
+> Conceptually the request path is `EIP → host:80 → socat → minikube
+> ingress → Service → Pod`. See `SETUP.md` "Phase 4" for the full
+> rationale and `PROGRESS.md` decision #39 for the alternatives
+> considered.
+
 **How the layers landed:**
 
 - **Day 1** — the app (Flask + gunicorn), its container, the repo hygiene.
