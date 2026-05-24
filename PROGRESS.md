@@ -1,6 +1,6 @@
 # Project Progress & Handoff
 
-> **Purpose**: If a new session/agent starts here, read this file + `SETUP.md` to get fully oriented. The original brief is the PDF at `/Users/ayberksavas/Downloads/InsiderOne_DevOps_Internship_Case_Study_2026_v2.pdf`.
+> **Purpose**: This file is the working journal and the authoritative decision log — checklist of done/pending tasks, numbered decisions (#1+) with the alternatives that were considered and rejected, working-directory orientation, and open questions. A new session or agent reading this file + [`SETUP.md`](./SETUP.md) should be able to resume work without context loss. The polished public-facing how-to (run / build / deploy / verify) lives in [`README.md`](./README.md); when prose in README is shorter than the rationale here, this file is the authoritative one. The original case-study brief is the PDF supplied separately (kept outside the repo).
 
 ---
 
@@ -66,6 +66,12 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 30. **Monitoring resources (`ServiceMonitor`, `PrometheusRule`, dashboard `ConfigMap`) live as templates in the app chart**, gated by a `monitoring.enabled` feature flag. Reason: they describe the *app's* observability surface, so they belong with the chart that ships the app. A single Helm release upgrades both code and monitoring together. The flag default (`false`) keeps the chart installable on a cluster without the kube-prometheus-stack CRDs (otherwise `helm install` errors with `no matches for kind "ServiceMonitor"`); `values-prod.yaml` flips it on. Install ordering on a fresh cluster: stack first (`scripts/install-monitoring.sh`), then app with the prod overlay.
 31. **Grafana dashboards are provisioned via a labelled `ConfigMap`** (the `grafana_dashboard: "1"` label, with the stack's Grafana sidecar set to `searchNamespace: ALL`), not via Grafana's HTTP API or a datasource provider config. Reason: "drop a labelled ConfigMap, get a dashboard" is the simplest possible provisioning path — no API tokens, no UID stability problems, no Grafana login required, and the dashboard JSON lives in version control next to the chart it documents. The dashboard JSON itself sits at `charts/app/dashboards/app-overview.json` and is read into the ConfigMap via `.Files.Get`, so the template stays small.
 32. **`HighErrorRate` alert has an explicit div-by-zero guard**. The natural expression is `5xx_rate / total_rate > 0.05`, but on an idle service `total_rate` is 0, and `0/0` in PromQL is `NaN` — the comparison silently fails and the alert never fires. Adding `and sum(rate(http_requests_total[1m])) > 0` makes the intent explicit: only alert when there is enough traffic for a ratio to be meaningful. The cost is two extra lines; the benefit is anyone reading the rule sees the design choice instead of wondering whether the alert is "broken" when it just hasn't seen requests.
+33. **IaC scope is PDF-minimum: EC2 + EIP + SG only, no IAM**. The PDF explicitly scopes Day 4.3 to *"defining the EC2, EIP, and security group with Terraform or OpenTofu"*. Codifying the OIDC provider, role, instance profile, and `DeployViaSSM` inline policy from Day 3 was the alternative — adds 4-5 more imports and IAM defense surface with no PDF requirement. IAM stays as documented manual setup. Closes the previous "Day 4 Terraform scope" open question. Easy follow-up: import the IAM resources in a future iteration; nothing in the existing code blocks that.
+34. **OpenTofu over Terraform**. OpenTofu is the open-source fork under the Linux Foundation, created after Hashicorp re-licensed Terraform under BUSL in 2023. HCL is identical — every file in `infra/` works unchanged with either CLI. The reasoning: for a personal project there's no reason to depend on a BUSL-licensed binary when the OSS fork is drop-in compatible. Easy story to defend in interview.
+35. **Used `tofu import` to bring existing resources into local state, then ran one `tofu apply` to align metadata**. The EC2, EIP, and SG were created manually on Day 0 — `apply` against a fresh config would have tried to *create new* alongside the live ones. The proper flow is import + iterate-until-plan-empty. After import, plan surfaced three benign metadata diffs (missing tags on EIP/EC2; empty rule descriptions on SG). A single `apply` aligned them — no destroys, no recreates, no rule changes. Final `plan` is empty. That empty-plan output is the proof the IaC is faithful.
+36. **EIP is bound to the EC2 via `network_interface` on the `aws_eip` resource, not via a separate `aws_eip_association` resource**. The standalone `aws_eip_association` has a known regression in the modern AWS provider (5.x) that errors at import time for VPC EIPs: *"with the retirement of EC2-Classic standard domain EC2 EIPs are no longer supported"*. The fix is to set `network_interface = aws_instance.minikube.primary_network_interface_id` directly on `aws_eip`, which AWS treats as an association declaration. This also keeps the import flow to 3 resources instead of 4.
+37. **`lifecycle.ignore_changes` set on specific attributes that are either immutable in AWS or where drift would be dangerous to "fix"**. (a) `[ami]` on the EC2: if `var.ami_id` ever drifted from the live AMI, an `apply` would launch a new instance and destroy the running host, taking minikube state, the `/opt/devops-case` checkout, and the SSM-managed deploy plumbing with it. AMI rotation must be an explicit human decision. (b) `[description, tags, tags_all]` on the SG: SG description is immutable in AWS (can't be changed without destroying the SG); tags are added once via the alignment apply, then left hands-off so the chart doesn't keep nudging them.
+38. **Local state, no remote backend**. PDF says *"local state is fine"* and this is a single-person project. Remote state (S3 bucket + DynamoDB lock table) would be the prod pattern in a team setting where concurrent applies need coordination, but the overhead has no benefit at this scale. State file is gitignored.
 
 ---
 
@@ -95,7 +101,7 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 - ✅ **3.1** GitHub Actions pipeline at `.github/workflows/ci.yml` — jobs `lint (ruff)`, `test (pytest)`, `build, scan, push`. Triggers on PR, push to `main`, push to `v*` tags, and `workflow_dispatch`. `docker/metadata-action` produces `:<short-sha>` + `:main` on main push, `:<semver>` + `:latest` on tag push, `:pr-N` on PRs (built+scanned only, never pushed). Trivy gates push on CRITICAL/HIGH with `--ignore-unfixed`. Merged via PR #5.
 - ✅ **3.2** Secrets & auth — two PRs, both merged:
   - **Gitleaks** (PR #6) — full-history scan (`fetch-depth: 0`) with `--redact` so any finding doesn't re-leak through the public Action log. Binary install (see decision #17).
-  - **AWS OIDC** (PR #7) — IAM OIDC identity provider for `token.actions.githubusercontent.com` created in account `809338888160` (eu-north-1). Role `github-actions-devops-case` with trust policy scoped to `repo:ayberksavas/devops-case:*` and no permission policies attached. Workflow's `aws OIDC (whoami)` job assumes the role and runs `aws sts get-caller-identity` on every event as a federation proof. Role ARN + region stored as repo *variables* (decision #20).
+  - **AWS OIDC** (PR #7) — IAM OIDC identity provider for `token.actions.githubusercontent.com` created in the project's AWS account (eu-north-1). Role `github-actions-devops-case` with trust policy scoped to `repo:ayberksavas/devops-case:*` and no permission policies attached. Workflow's `aws OIDC (whoami)` job assumes the role and runs `aws sts get-caller-identity` on every event as a federation proof. Role ARN + region stored as repo *variables* (decision #20).
 - ✅ **3.3** Release hygiene — `CHANGELOG.md` (Keep a Changelog) merged via PR #8. Trivy install switched from `aquasecurity/setup-trivy@v0.2.6` to direct binary download (decision #17) — merged via the trivy-fix + docs PR. Tag `v0.1.0` pushed from `main`; CI auto-published `:0.1.0` + `:latest` to GHCR; GitHub Release page exists at `releases/tag/v0.1.0` with notes extracted from CHANGELOG. Chart `appVersion`, git tag, and image tag all aligned.
 - ✅ **3.4** Auto-deploy on merge — chose CI-push via OIDC + SSM (decision #23). Extended OIDC role with inline `DeployViaSSM` policy (decision #24). EC2 got an `AmazonSSMManagedInstanceCore` instance profile and an `ubuntu`-owned `/opt/devops-case` checkout. New `deploy (ssm → ec2 → helm)` job in `ci.yml` invokes `scripts/deploy.sh` on the instance via `aws ssm send-command` after every successful main-branch build. Stdout/stderr captured and printed in the workflow log.
 - ⏭ **3.5** Bonus (cosign / SBOM / multi-arch / release-please) — intentionally skipped. Day 4 has its own scope (observability + IaC + docs) and consumed bonus would push core work to overflow.
@@ -117,7 +123,16 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
   - **Dashboard** — `charts/app/dashboards/app-overview.json` shipped via `charts/app/templates/dashboard-configmap.yaml` (labelled `grafana_dashboard: "1"`, picked up by Grafana's sidecar at `searchNamespace: ALL`). Four panels: RPS by path, p95 latency by path, 5xx rate, pod restarts (15m delta). Decision #31.
   - **`monitoring.enabled` flag** in `values.yaml` (default `false`) and `values-prod.yaml` (flipped to `true`) gates all three monitoring resources so the chart still installs on a cluster without the kube-prometheus-stack CRDs. Decision #30.
   - **Verified on EC2** — stack pods all `Running`; both app pods `up` as scrape targets (`serviceMonitor/default/app/0`); `HighErrorRate` loaded and `inactive`; `Watchdog` firing as expected (dead-man's switch for the pipeline); dashboard renders RPS spike from a 200-request smoke loop with sub-millisecond p95.
-- ⬜ **4.3** IaC — Terraform/OpenTofu for EC2 + EIP + SG (scope of OIDC role/instance profile still open — see "Open questions")
+- ✅ **4.3** Infrastructure as Code
+  - **OpenTofu config** at `infra/` describes the Day 0 AWS surface: `data.aws_vpc.default` (referenced, not created), `aws_security_group.minikube` with inline ingress/egress rules, `aws_instance.minikube`, and `aws_eip.minikube` bound via `network_interface`. Outputs: `instance_id`, `public_ip`, `security_group_id`.
+  - **Scope: PDF minimum only** (EC2 + EIP + SG). IAM resources from Day 3 left as documented manual setup. Decision #33.
+  - **OpenTofu over Terraform** — drop-in OSS fork under the Linux Foundation, identical HCL, no BUSL license dependency. Decision #34.
+  - **Import flow, not apply-from-scratch** — `scripts/terraform-import.sh` brings the 3 existing live resources into local state via `tofu import`. Then a single `tofu apply` aligned three metadata diffs (EIP tags missing, EC2 missing `Project` tag, SG rule descriptions empty). Final `tofu plan` is empty — IaC is now a faithful description of reality. Decision #35.
+  - **`network_interface` on `aws_eip`, not `aws_eip_association`** — the standalone association resource has a known regression for VPC EIPs that errors at import time. Binding directly on `aws_eip` via the EC2's `primary_network_interface_id` avoids the broken path. Decision #36.
+  - **SG name `launch-wizard-3`** — matched to live rather than renamed, because renaming a SG is a destroy/recreate which would detach from the live EC2. Cosmetic-only cleanup not worth the network outage. Documented in `main.tf` comments.
+  - **`lifecycle.ignore_changes`**: `[ami]` on the EC2 (guards against accidental host recreation if `var.ami_id` drifts), `[description, tags, tags_all]` on the SG (description is immutable in AWS; tags hands-off post-alignment). Decision #37.
+  - **Local state, no S3 backend** — PDF says local is fine for a one-person project; team setting would use S3 + DynamoDB lock. Decision #38.
+  - **Verified on AWS** — `tofu apply` succeeded with `0 added, 3 changed, 0 destroyed`; subsequent `tofu plan` output: *"No changes. Your infrastructure matches the configuration."* Output values (`public_ip`, `instance_id`, `security_group_id`) match the live resources — IDs intentionally omitted from this doc.
 - ⬜ **4.4** Architecture & docs — RUNBOOK.md, SECURITY.md, ≥3 ADRs, architecture diagram
 
 ---
@@ -125,7 +140,7 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 ## Working directory
 
 ```
-/Users/ayberksavas/Desktop/devops-case/
+devops-case/                       # repo root
 ├── .github/
 │   ├── CODEOWNERS                 # * → @ayberksavas
 │   ├── pull_request_template.md   # conventional commits checklist
@@ -167,6 +182,14 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 ├── SETUP.md                       # Day 0 infra log
 ├── app.py                         # Flask: /ping, /healthz, /version
 ├── docker-compose.yaml            # local-dev convenience
+├── infra/                         # OpenTofu config describing the AWS surface (Day 4.3)
+│   ├── .gitignore                 # .terraform/, *.tfstate*, terraform.tfvars
+│   ├── .terraform.lock.hcl        # provider version pin (committed for reproducibility)
+│   ├── main.tf                    # data.aws_vpc.default + SG + EC2 + EIP
+│   ├── outputs.tf                 # instance_id, public_ip, security_group_id
+│   ├── terraform.tfvars.example   # ami_id + ssh_allowed_cidr template
+│   ├── variables.tf               # region, instance_type, ami_id, ssh_allowed_cidr, ...
+│   └── versions.tf                # required_version >= 1.5, aws ~> 5.70
 ├── monitoring/
 │   └── values.yaml                # slim profile for kube-prometheus-stack (Day 4.2)
 ├── pyproject.toml                 # ruff config (Day 3)
@@ -174,7 +197,8 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 ├── requirements-dev.txt           # -r requirements.txt + pytest==8.3.3, ruff==0.7.4
 ├── scripts/
 │   ├── deploy.sh                  # runs on EC2 via SSM after main merge (Day 3.4)
-│   └── install-monitoring.sh      # idempotent install of kube-prometheus-stack (Day 4.2)
+│   ├── install-monitoring.sh      # idempotent install of kube-prometheus-stack (Day 4.2)
+│   └── terraform-import.sh        # idempotent tofu import of the 3 live AWS resources (Day 4.3)
 ├── test_app.py                    # 7 pytest tests (endpoints, /metrics, request_id, JSON formatter)
 └── .venv/                         # gitignored, local python env
 ```
@@ -203,7 +227,7 @@ The `.pem` lives outside this directory (don't commit). Elastic IP is in the AWS
 
 - **Image size optimisation (slim → distroless)** — documented upgrade path. Not needed in practice: Trivy is clean at CRITICAL/HIGH with `--ignore-unfixed`, so `python:3.12-slim` is fine for now.
 - **OIDC trust scope tightening** — currently any ref in the repo can assume the role (`repo:ayberksavas/devops-case:*`). Now that 3.4 deploy is wired, could tighten to `:ref:refs/heads/main` for the deploy role. Keeping the wildcard for now so PR runs can still demo `aws sts get-caller-identity`.
-- **Day 4 Terraform scope** — at minimum the EC2 + EIP + SG (PDF asks for this). Could also pull in the OIDC provider, OIDC role, EC2 instance profile, and the inline `DeployViaSSM` policy from Day 3 to fully codify the AWS surface. Decide at Day 4.
+- ~~**Day 4 Terraform scope**~~ — *Resolved on Day 4.3 (decision #33): scoped to the PDF minimum (EC2 + EIP + SG). IAM resources from Day 3 remain documented manual setup.*
 
 ---
 

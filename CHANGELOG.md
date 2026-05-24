@@ -65,6 +65,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   installs cleanly on a cluster without the kube-prometheus-stack CRDs.
   `values-prod.yaml` flips it to `true`.
 
+### Added (Day 4.3 — Infrastructure as Code)
+
+- **`infra/` directory** — OpenTofu / Terraform configuration that describes
+  the Day 0 AWS surface: one EC2 instance (`aws_instance.minikube`), one
+  Elastic IP (`aws_eip.minikube`) bound to the instance's primary network
+  interface, and one security group (`aws_security_group.minikube`) with
+  inline ingress (SSH /32, HTTP, HTTPS, NodePort 30000-32767) and egress
+  (all) rules. Files: `versions.tf`, `variables.tf`, `main.tf`,
+  `outputs.tf`, `terraform.tfvars.example`, `.gitignore`,
+  `.terraform.lock.hcl`. Scoped to the PDF minimum — IAM (OIDC
+  provider, role, instance profile, `DeployViaSSM` policy) intentionally
+  left as documented manual setup from Day 3.
+- **`scripts/terraform-import.sh`** — idempotent helper that brings the
+  3 existing live resources into local OpenTofu state via `tofu import`.
+  Safe to re-run (skips already-imported resources). After running,
+  `tofu plan` was used to surface the metadata drift (missing tags,
+  empty rule descriptions); a single `tofu apply` aligned the live
+  resources to the configuration. Final `tofu plan` is empty —
+  the IaC is now a faithful description of reality.
+- **Decision log entries** — choice of OpenTofu over Terraform; choice
+  of inline ingress/egress over separate `aws_vpc_security_group_*_rule`
+  resources for simpler import; binding the EIP via the
+  `network_interface` attribute on `aws_eip` instead of a separate
+  `aws_eip_association` resource (which has a known import regression
+  for VPC EIPs); `lifecycle.ignore_changes` on the SG's `description`
+  (immutable in AWS, set by the launch wizard); `lifecycle.ignore_changes`
+  on the EC2's `ami` to prevent accidental host recreation.
+
 ## [0.1.0] - 2026-05-23
 
 First tagged release. Covers Days 0–3 of the InsiderOne DevOps case study:
