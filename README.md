@@ -89,7 +89,7 @@ client ──HTTP──▶ Ingress (nginx) ──▶ Service (ClusterIP) ──�
                               └────────────────────────────────────────┘
 ```
 
-Day 2 added the Helm-managed Kubernetes layer (see below). Day 3 added the CI/CD pipeline that lints, tests, scans, and publishes the image to GHCR (see CI/CD section). Day 4.1 added the app-side observability surface — JSON logs, request IDs, and a `/metrics` endpoint (see [Observability](#observability)); kube-prometheus-stack and Grafana land in 4.2.
+Day 2 added the Helm-managed Kubernetes layer (see below). Day 3 added the CI/CD pipeline that lints, tests, scans, and publishes the image to GHCR (see CI/CD section). Day 4.1 added the app-side observability surface — JSON logs, request IDs, and a `/metrics` endpoint. Day 4.2 added the cluster-side observability stack — Prometheus, Alertmanager, Grafana, and a `ServiceMonitor` so the app's metrics get scraped (see [Observability](#observability)).
 
 ## Kubernetes (Helm)
 
@@ -401,6 +401,105 @@ curl -sS http://127.0.0.1:8080/metrics | grep -E '^http_'
 The `http_requests_total{...path="/ping"...}` line should sum to 10
 across both workers.
 
+### Prometheus + Grafana (Day 4.2)
+
+The cluster-side observability stack is **kube-prometheus-stack** — the
+upstream Helm chart from `prometheus-community` that bundles Prometheus,
+Alertmanager, Grafana, the Prometheus operator, kube-state-metrics, and
+node-exporter into a single install.
+
+#### Installing the stack
+
+```bash
+# Run from the repo root on the cluster host
+bash scripts/install-monitoring.sh
+```
+
+The script is idempotent (`helm upgrade --install`), creates the
+`monitoring` namespace, and pins the chart at version `65.5.0`. Override
+with `CHART_VERSION=… bash scripts/install-monitoring.sh` to bump
+deliberately.
+
+#### Slim profile — why each knob
+
+The EC2 host has 4 GiB RAM and runs minikube + the app + Linux on top.
+A default kube-prometheus-stack install reserves around 2 GiB for
+Prometheus alone, which would OOM the host. `monitoring/values.yaml`
+trims each component to fit; every override is annotated in-file.
+Headlines:
+
+| Component | What changed | Why |
+|---|---|---|
+| Prometheus | 250Mi req / 600Mi limit, retention `2d`, `emptyDir` storage | Default 2GB+ doesn't fit. 2d retention is enough to see a working day's trends. `emptyDir` means a pod restart resets history — acceptable on a demo. |
+| Selectors | `serviceMonitorSelectorNilUsesHelmValues: false` (and same for PodMonitor / Rule / Probe) | Default behaviour is to filter on `release: <release-name>` labels, which would silently drop our app's `ServiceMonitor`. Disabling the filter lets any SM in any namespace be picked up. |
+| Alertmanager | 32Mi req / 64Mi limit, 24h retention | Same RAM story; demo cluster doesn't need long history. |
+| Grafana | 80Mi req / 192Mi limit, persistence off, `adminPassword: admin` | Reached only via `kubectl port-forward`. No persistent dashboards beyond what we provision. Admin password is annotated as demo-only. |
+| Control-plane scraping | `kubeControllerManager`, `kubeScheduler`, `kubeProxy`, `kubeEtcd` all disabled | Minikube doesn't expose these endpoints externally. Default install would generate noisy "target down" alerts. |
+| Default rules | Same four `rules.*` flipped off | Removes the alert definitions whose targets we just disabled. |
+
+#### How the app gets scraped
+
+Three resources, all rendered conditionally by `monitoring.enabled`:
+
+| Template | Purpose |
+|---|---|
+| `charts/app/templates/servicemonitor.yaml` | Tells the operator to scrape the app's `Service` on port `http` at `/metrics`, every 15s. |
+| `charts/app/templates/prometheusrule.yaml` | One alert (`HighErrorRate`) — 5xx ratio over 1m > 5% for 5m, with a `> 0` guard against div-by-zero. |
+| `charts/app/templates/dashboard-configmap.yaml` | Wraps `charts/app/dashboards/app-overview.json` in a `ConfigMap` carrying the `grafana_dashboard: "1"` label. Grafana's sidecar (set to `searchNamespace: ALL`) auto-discovers it. |
+
+`monitoring.enabled` defaults to `false` in `values.yaml` so the chart
+installs on a fresh cluster before the stack's CRDs exist;
+`values-prod.yaml` flips it to `true`.
+
+#### Install ordering
+
+The chart's monitoring templates reference CRDs
+(`ServiceMonitor`, `PrometheusRule`) shipped by kube-prometheus-stack.
+**Install the stack before deploying the app with `monitoring.enabled: true`**
+or `helm install` will fail with `no matches for kind "ServiceMonitor"`.
+
+When making changes via CI:
+
+1. SSH to EC2, `git checkout` the branch, `bash scripts/install-monitoring.sh` (one-time).
+2. Merge the PR → auto-deploy lays down the monitoring resources, which the operator picks up.
+
+#### Verifying on the cluster
+
+```bash
+# Operator picked up the ServiceMonitor and rule
+kubectl get servicemonitor,prometheusrule -l app.kubernetes.io/name=app
+# expect: one of each
+
+# Prometheus is scraping both app pods
+kubectl -n monitoring port-forward svc/kps-kube-prometheus-stack-prometheus 9090:9090 &
+curl -sS http://localhost:9090/api/v1/targets \
+  | python3 -c "import sys,json; [print(t['labels']['job'], t['labels'].get('pod',''), t['health']) for t in json.load(sys.stdin)['data']['activeTargets'] if t['labels'].get('job') == 'app']"
+# expect: two lines, both 'up'
+
+# Alert is loaded
+curl -sS http://localhost:9090/api/v1/rules | grep -o '"name":"HighErrorRate"'
+```
+
+For Grafana, port-forward (and SSH-tunnel from your laptop if you're on EC2):
+
+```bash
+# On the cluster host
+kubectl -n monitoring port-forward svc/kps-grafana 3000:80
+
+# From your laptop (in another terminal)
+ssh -i devops-case.pem -L 3000:localhost:3000 -L 9090:localhost:9090 ubuntu@<EIP>
+```
+
+Then open `http://localhost:3000` (admin / admin) → Dashboards → "App overview".
+
+#### Why port-forward, not a public ingress
+
+Grafana on this stack has `adminPassword: admin` and no other auth in
+front of it. Exposing it through nginx-ingress would mean leaking an
+unauthenticated dashboard on the internet. The port-forward + SSH tunnel
+pattern means access is gated by EC2 SSH keys, which already exist and
+already enforce a per-IP allowlist on the security group.
+
 ## Project status
 
 See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progress.
@@ -418,6 +517,11 @@ See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progres
 - **Why CI-push deploy via SSM (not ArgoCD/Flux GitOps)**: see the [Auto-deploy on merge](#auto-deploy-on-merge) table. Short version: we already built the OIDC machinery for 3.2, so deploy adds one IAM policy + one workflow job. ArgoCD is the right answer at multi-app multi-team scale; here it would add ~500 MiB on a 4 GiB EC2 plus a control plane to manage, for marginal benefit on one Flask app.
 - **Why the EC2 holds a checkout of the repo at `/opt/devops-case`** (instead of CI rendering manifests and shipping them via SSM): rendered Helm output is bigger than the 4 KiB SSM inline-command limit. The alternatives are an S3 hop or compressing the YAML, both of which add moving parts. A `git fetch && reset --hard origin/main` on the EC2 is one network round-trip and keeps the deploy script tiny.
 - **Why `prometheus_client` multiprocess mode (not 1 gunicorn worker, not per-worker drift)**: gunicorn runs 2 workers (production-realistic; locked on Day 1). With each worker holding its own counters, a Prometheus scrape would see flickering numbers and the Day 4.2 dashboards (RPS, error rate) would be useless. Multiprocess mode is the canonical fix — ~30 lines split across `gunicorn.conf.py` (a `child_exit` hook), an `emptyDir` volume in the chart, and one env var in the image. Dropping to 1 worker would reverse a documented prior decision and lose any concurrency story; living with drift would make the dashboards lie.
+- **Why a slim kube-prometheus-stack profile (not the defaults)**: a default install reserves ~2 GiB for Prometheus alone and would OOM the 4 GiB EC2 alongside minikube + the app + Linux. The slim profile at `monitoring/values.yaml` trims Prometheus to 250Mi/600Mi req/limit, drops retention to 2 days, uses `emptyDir` instead of a PVC, and disables scraping for control-plane components minikube doesn't expose. Total stack footprint lands around 700–900 MiB, leaving plenty of headroom.
+- **Why a bash install script, not a sub-chart**: `scripts/install-monitoring.sh` is the same pattern as `scripts/deploy.sh` from Day 3 — one idempotent command, version-pinned, easy to re-run. A `charts/observability/` sub-chart with kube-prometheus-stack as a dependency would buy a `Chart.lock` for version pinning but add the question *"why a chart wrapper for one external dep?"* — which doesn't have a great answer at this scale. The script is the simpler story.
+- **Why monitoring resources live in the app chart (not a separate chart)**: `ServiceMonitor`, `PrometheusRule`, and the dashboard `ConfigMap` are *about the app*. Keeping them in `charts/app/templates/` with a `monitoring.enabled` flag means the chart describes the full surface of what the app deploys, and a release rolls both code and monitoring together. The flag default (`false`) lets the chart still install on a cluster that doesn't have the stack CRDs yet.
+- **Why a `grafana_dashboard: "1"` ConfigMap (not a Grafana provider config)**: the kube-prometheus-stack's Grafana ships a sidecar that watches for ConfigMaps with that label across all namespaces (we set `searchNamespace: ALL`). Shipping a dashboard becomes "drop a labeled ConfigMap", with no Grafana datasource provisioning, no API tokens, no UID stability problems. The dashboard JSON lives at `charts/app/dashboards/app-overview.json` and is read into the ConfigMap via `.Files.Get`.
+- **Why a div-by-zero guard on the `HighErrorRate` alert**: the alert expression is `5xx_rate / total_rate > 0.05`. On an idle service `total_rate` is 0, and `0/0` in PromQL is `NaN` — the comparison silently fails and the alert never fires. Adding `and sum(rate(http_requests_total[1m])) > 0` makes the intent explicit (only alert when there's traffic to evaluate) and avoids leaving someone wondering whether the alert is "broken" when it just hasn't seen requests.
 
 Full ADRs land on Day 4 under `docs/adr/`.
 

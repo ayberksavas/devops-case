@@ -36,6 +36,35 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   env var `PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc` and the
   directory is pre-created and chowned to `appuser` in the runtime image.
 
+### Added (Day 4.2 — Prometheus + Grafana)
+
+- **kube-prometheus-stack** installed on the cluster via a slim values
+  profile at `monitoring/values.yaml` and an idempotent install script at
+  `scripts/install-monitoring.sh` (pinned to chart version `65.5.0`).
+  Slim profile fits the 4 GiB EC2: Prometheus 250Mi/600Mi request/limit,
+  2-day retention, `emptyDir` TSDB instead of a PVC, disabled scraping of
+  `kube-controller-manager` / `kube-scheduler` / `kube-proxy` / etcd
+  (minikube doesn't expose them). Total stack footprint ≈700–900 MiB.
+- **Scrape target wiring** — `charts/app/templates/servicemonitor.yaml`
+  declares a `ServiceMonitor` that points Prometheus at the app's `/metrics`
+  endpoint (15s interval, port `http`). Picked up by the operator without
+  any release-label gymnastics because the slim values set
+  `serviceMonitorSelectorNilUsesHelmValues: false`.
+- **Alert rule** — `charts/app/templates/prometheusrule.yaml` defines
+  `HighErrorRate`: 5xx ratio over a 1-minute window > 5% for 5 minutes,
+  with an explicit `and sum(rate(http_requests_total[1m])) > 0` guard
+  against div-by-zero on an idle service.
+- **Grafana dashboard** — JSON at `charts/app/dashboards/app-overview.json`,
+  shipped via `charts/app/templates/dashboard-configmap.yaml` as a
+  `ConfigMap` carrying the `grafana_dashboard: "1"` label. Grafana's
+  sidecar (set to `searchNamespace: ALL` in the slim values) discovers
+  it automatically across namespaces. Four panels: RPS by path, p95
+  latency by path, 5xx error rate, pod restarts (15-minute delta).
+- **`monitoring.enabled` flag** in the app chart — gates the three
+  monitoring resources above. Default `false` so the chart still
+  installs cleanly on a cluster without the kube-prometheus-stack CRDs.
+  `values-prod.yaml` flips it to `true`.
+
 ## [0.1.0] - 2026-05-23
 
 First tagged release. Covers Days 0–3 of the InsiderOne DevOps case study:

@@ -61,6 +61,11 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 25. **Prometheus metrics use `prometheus_client` multiprocess mode**, not a single-worker workaround. gunicorn runs 2 workers (decision #8, kept for production realism), so without coordination each worker would hold its own counters and Prometheus scrapes would see flickering totals — fatal for Day 4.2's RPS/error-rate dashboards. The standard fix: set `PROMETHEUS_MULTIPROC_DIR` on the container, add a `child_exit` hook in `gunicorn.conf.py` that calls `multiprocess.mark_process_dead(worker.pid)`, and have `/metrics` instantiate a fresh `CollectorRegistry` + `MultiProcessCollector` per scrape. In Kubernetes the chart mounts an `emptyDir` (`medium: Memory`, 16Mi) at that path; rollout = clean counter slate, which is the desired behaviour. Alternatives rejected: (a) drop to 1 worker — reverses decision #8 and removes any concurrency story; (b) live with per-worker drift and document it — makes the 4.2 dashboards lie.
 26. **Gunicorn config moved to `gunicorn.conf.py`** instead of inline CLI flags in the Dockerfile ENTRYPOINT. Driven by decision #25 (needs the `child_exit` hook), but also lets us disable gunicorn's plaintext access log in one place — the Flask `after_request` hook is the single source of per-request log lines, all in JSON.
 27. **Two app metrics, both labelled by matched URL rule (not raw path)**: `http_requests_total{method,path,status}` (Counter) and `http_request_duration_seconds{method,path}` (Histogram). Labelling on `request.url_rule.rule` instead of `request.path` keeps cardinality bounded — an unknown URL with arbitrary query/path noise can't blow up the time series store. Unmatched routes fall into a single `unmatched` bucket. `/metrics` itself is excluded so the scrape doesn't bias its own series.
+28. **kube-prometheus-stack runs on a slim values profile**, not the defaults. The 4 GiB EC2 hosts minikube + the app + Linux; a default install reserves ~2 GiB for Prometheus alone and would OOM the host. `monitoring/values.yaml` trims Prometheus to 250Mi/600Mi req/limit with 2-day retention and `emptyDir` storage; sets `serviceMonitorSelectorNilUsesHelmValues: false` (and same for PodMonitor / Rule / Probe) so the operator picks up SMs regardless of release-label; disables scraping for `kube-controller-manager` / `kube-scheduler` / `kube-proxy` / etcd (minikube doesn't expose them); tightens Alertmanager / Grafana / node-exporter resources. Trade-off: a Prometheus pod restart wipes history because there's no PVC, which is acceptable on a demo cluster but not in real prod. Total footprint lands around 700–900 MiB, leaving plenty of headroom for the app and Linux.
+29. **Stack install is a bash script (`scripts/install-monitoring.sh`), not a sub-chart**. The script mirrors `scripts/deploy.sh` from Day 3.4 — one idempotent `helm upgrade --install`, version-pinned (chart `65.5.0`), with the values file referenced as `-f monitoring/values.yaml`. A `charts/observability/` sub-chart with kube-prometheus-stack as a dependency would add a `Chart.lock` for version pinning but introduce a wrapper-chart with one external dependency, and the "why a wrapper for one external dep?" question doesn't have a good answer at this scale. The script is the simpler, more easily explained shape.
+30. **Monitoring resources (`ServiceMonitor`, `PrometheusRule`, dashboard `ConfigMap`) live as templates in the app chart**, gated by a `monitoring.enabled` feature flag. Reason: they describe the *app's* observability surface, so they belong with the chart that ships the app. A single Helm release upgrades both code and monitoring together. The flag default (`false`) keeps the chart installable on a cluster without the kube-prometheus-stack CRDs (otherwise `helm install` errors with `no matches for kind "ServiceMonitor"`); `values-prod.yaml` flips it on. Install ordering on a fresh cluster: stack first (`scripts/install-monitoring.sh`), then app with the prod overlay.
+31. **Grafana dashboards are provisioned via a labelled `ConfigMap`** (the `grafana_dashboard: "1"` label, with the stack's Grafana sidecar set to `searchNamespace: ALL`), not via Grafana's HTTP API or a datasource provider config. Reason: "drop a labelled ConfigMap, get a dashboard" is the simplest possible provisioning path — no API tokens, no UID stability problems, no Grafana login required, and the dashboard JSON lives in version control next to the chart it documents. The dashboard JSON itself sits at `charts/app/dashboards/app-overview.json` and is read into the ConfigMap via `.Files.Get`, so the template stays small.
+32. **`HighErrorRate` alert has an explicit div-by-zero guard**. The natural expression is `5xx_rate / total_rate > 0.05`, but on an idle service `total_rate` is 0, and `0/0` in PromQL is `NaN` — the comparison silently fails and the alert never fires. Adding `and sum(rate(http_requests_total[1m])) > 0` makes the intent explicit: only alert when there is enough traffic for a ratio to be meaningful. The cost is two extra lines; the benefit is anyone reading the rule sees the design choice instead of wondering whether the alert is "broken" when it just hasn't seen requests.
 
 ---
 
@@ -104,7 +109,14 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
   - **Multiprocess metrics** via `prometheus_client.multiprocess` — `PROMETHEUS_MULTIPROC_DIR` env in the image, `mark_process_dead(worker.pid)` on `child_exit`, `MultiProcessCollector` per scrape. Helm chart mounts an `emptyDir` (`medium: Memory`, 16Mi) at the multiproc dir so rollouts reset cleanly. Decision #25.
   - **Tests** — 7/7 pytest pass (up from 3): added coverage for `/metrics` response shape, `X-Request-ID` generation and round-trip, and `JsonFormatter` field shape.
   - **Verified locally** — ruff clean, pytest green, Flask-dev smoke OK, gunicorn 2-worker smoke confirmed multiproc aggregation produces summed counters (`http_requests_total{path="/ping"} 10.0` after 10 requests against 2 workers, with both `counter_<pid>.db` files present in the multiproc dir).
-- ⬜ **4.2** Prometheus + Grafana — kube-prometheus-stack on minikube, ≥1 dashboard, ≥1 alert
+- ✅ **4.2** Prometheus + Grafana
+  - **kube-prometheus-stack** installed at chart version `65.5.0` in the `monitoring` namespace (release name `kps`). One bash script wraps the helm install for repeatability — `scripts/install-monitoring.sh`. Decision #29.
+  - **Slim profile** at `monitoring/values.yaml` — trims Prometheus to 250Mi/600Mi req/limit, 2-day retention, `emptyDir` TSDB; disables scraping of `kube-controller-manager` / `kube-scheduler` / `kube-proxy` / etcd (minikube doesn't expose them); tightens Alertmanager / Grafana / node-exporter resources. Total stack footprint ≈700–900 MiB on the 4 GiB EC2. Each override annotated in-file. Decision #28.
+  - **Scrape wiring** — `charts/app/templates/servicemonitor.yaml` points Prometheus at the app's `/metrics` (port `http`, 15s). Picked up by the operator because the slim values set `serviceMonitorSelectorNilUsesHelmValues: false`.
+  - **Alert** — `charts/app/templates/prometheusrule.yaml`: `HighErrorRate` fires when 5xx ratio > 5% over 1m for 5m sustained. Explicit `and sum(rate(http_requests_total[1m])) > 0` guard prevents NaN-on-idle silently never firing. Decision #32.
+  - **Dashboard** — `charts/app/dashboards/app-overview.json` shipped via `charts/app/templates/dashboard-configmap.yaml` (labelled `grafana_dashboard: "1"`, picked up by Grafana's sidecar at `searchNamespace: ALL`). Four panels: RPS by path, p95 latency by path, 5xx rate, pod restarts (15m delta). Decision #31.
+  - **`monitoring.enabled` flag** in `values.yaml` (default `false`) and `values-prod.yaml` (flipped to `true`) gates all three monitoring resources so the chart still installs on a cluster without the kube-prometheus-stack CRDs. Decision #30.
+  - **Verified on EC2** — stack pods all `Running`; both app pods `up` as scrape targets (`serviceMonitor/default/app/0`); `HighErrorRate` loaded and `inactive`; `Watchdog` firing as expected (dead-man's switch for the pipeline); dashboard renders RPS spike from a 200-request smoke loop with sub-millisecond p95.
 - ⬜ **4.3** IaC — Terraform/OpenTofu for EC2 + EIP + SG (scope of OIDC role/instance profile still open — see "Open questions")
 - ⬜ **4.4** Architecture & docs — RUNBOOK.md, SECURITY.md, ≥3 ADRs, architecture diagram
 
@@ -125,15 +137,20 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 │       ├── values.yaml            # prod-shaped defaults with inline rationale
 │       ├── values-dev.yaml        # dev overlay (replicas=1, dev host)
 │       ├── values-prod.yaml       # explicit prod overlay
+│       ├── dashboards/
+│       │   └── app-overview.json # 4-panel Grafana dashboard JSON (Day 4.2)
 │       └── templates/
 │           ├── _helpers.tpl
 │           ├── configmap.yaml     # BUILD_SHA
+│           ├── dashboard-configmap.yaml  # ConfigMap wrapping the dashboard JSON, labelled for Grafana sidecar pickup (Day 4.2)
 │           ├── deployment.yaml    # probes on /healthz, envFrom, security context
 │           ├── ingress.yaml       # nginx class
 │           ├── NOTES.txt
+│           ├── prometheusrule.yaml # HighErrorRate alert, gated by monitoring.enabled (Day 4.2)
 │           ├── secret.yaml        # DEMO_TOKEN placeholder
 │           ├── service.yaml       # ClusterIP, 80 → 8080
 │           ├── serviceaccount.yaml
+│           ├── servicemonitor.yaml # scrape /metrics, gated by monitoring.enabled (Day 4.2)
 │           └── tests/test-connection.yaml
 ├── daily-checkpoints/
 │   ├── day0-checkpoint.pdf        # EC2 + SG + tool versions evidence (redacted)
@@ -150,11 +167,14 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 ├── SETUP.md                       # Day 0 infra log
 ├── app.py                         # Flask: /ping, /healthz, /version
 ├── docker-compose.yaml            # local-dev convenience
+├── monitoring/
+│   └── values.yaml                # slim profile for kube-prometheus-stack (Day 4.2)
 ├── pyproject.toml                 # ruff config (Day 3)
 ├── requirements.txt               # flask==3.0.3, gunicorn==23.0.0, prometheus-client==0.21.0
 ├── requirements-dev.txt           # -r requirements.txt + pytest==8.3.3, ruff==0.7.4
 ├── scripts/
-│   └── deploy.sh                  # runs on EC2 via SSM after main merge (Day 3.4)
+│   ├── deploy.sh                  # runs on EC2 via SSM after main merge (Day 3.4)
+│   └── install-monitoring.sh      # idempotent install of kube-prometheus-stack (Day 4.2)
 ├── test_app.py                    # 7 pytest tests (endpoints, /metrics, request_id, JSON formatter)
 └── .venv/                         # gitignored, local python env
 ```
