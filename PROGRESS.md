@@ -58,6 +58,9 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 22. **`:latest` tracks releases, not `main`**: metadata-action enables `:latest` only on `github.ref_type == 'tag'`. Registry convention is that `:latest` means "latest released version", not "latest commit". Main commits get pinned via `:main` and `:<short-sha>` instead.
 23. **Auto-deploy via CI push (OIDC + SSM), not GitOps**: chose `kubectl set image` flavor — specifically `aws ssm send-command` invoking `bash scripts/deploy.sh <sha>` on the EC2 instance — over ArgoCD/Flux. Rationale: extends the existing OIDC role with one inline IAM policy and adds one workflow job; ArgoCD would add a ~500 MiB control plane on the 4 GiB EC2 plus an `Application` CR for marginal benefit on a single-node single-app cluster. GitOps is the right answer at multi-app multi-team scale; here it would be ceremony.
 24. **EC2 holds a checkout of the repo at `/opt/devops-case`** (owned by `ubuntu`) rather than having CI render manifests and ship them via SSM. Reason: rendered Helm output is larger than the 4 KiB SSM inline-command limit, and the alternatives (S3 hop, base64-compressed YAML, etc.) add moving parts. A `git fetch && reset --hard origin/main` on the instance is one network round-trip and keeps the deploy script tiny. Trade-off: the cluster host needs git connectivity to GitHub (already does for `git pull` to work), and the repo is duplicated between CI runner and EC2.
+25. **Prometheus metrics use `prometheus_client` multiprocess mode**, not a single-worker workaround. gunicorn runs 2 workers (decision #8, kept for production realism), so without coordination each worker would hold its own counters and Prometheus scrapes would see flickering totals — fatal for Day 4.2's RPS/error-rate dashboards. The standard fix: set `PROMETHEUS_MULTIPROC_DIR` on the container, add a `child_exit` hook in `gunicorn.conf.py` that calls `multiprocess.mark_process_dead(worker.pid)`, and have `/metrics` instantiate a fresh `CollectorRegistry` + `MultiProcessCollector` per scrape. In Kubernetes the chart mounts an `emptyDir` (`medium: Memory`, 16Mi) at that path; rollout = clean counter slate, which is the desired behaviour. Alternatives rejected: (a) drop to 1 worker — reverses decision #8 and removes any concurrency story; (b) live with per-worker drift and document it — makes the 4.2 dashboards lie.
+26. **Gunicorn config moved to `gunicorn.conf.py`** instead of inline CLI flags in the Dockerfile ENTRYPOINT. Driven by decision #25 (needs the `child_exit` hook), but also lets us disable gunicorn's plaintext access log in one place — the Flask `after_request` hook is the single source of per-request log lines, all in JSON.
+27. **Two app metrics, both labelled by matched URL rule (not raw path)**: `http_requests_total{method,path,status}` (Counter) and `http_request_duration_seconds{method,path}` (Histogram). Labelling on `request.url_rule.rule` instead of `request.path` keeps cardinality bounded — an unknown URL with arbitrary query/path noise can't blow up the time series store. Unmatched routes fall into a single `unmatched` bucket. `/metrics` itself is excluded so the scrape doesn't bias its own series.
 
 ---
 
@@ -92,8 +95,18 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 - ✅ **3.4** Auto-deploy on merge — chose CI-push via OIDC + SSM (decision #23). Extended OIDC role with inline `DeployViaSSM` policy (decision #24). EC2 got an `AmazonSSMManagedInstanceCore` instance profile and an `ubuntu`-owned `/opt/devops-case` checkout. New `deploy (ssm → ec2 → helm)` job in `ci.yml` invokes `scripts/deploy.sh` on the instance via `aws ssm send-command` after every successful main-branch build. Stdout/stderr captured and printed in the workflow log.
 - ⏭ **3.5** Bonus (cosign / SBOM / multi-arch / release-please) — intentionally skipped. Day 4 has its own scope (observability + IaC + docs) and consumed bonus would push core work to overflow.
 
-### Day 4
-- ⬜ JSON logs, `/metrics`, kube-prometheus-stack, Grafana dashboard, alert rule, Terraform (Track A), RUNBOOK, SECURITY.md, ≥3 ADRs, architecture diagram
+### Day 4 — Observability & Docs
+- ✅ **4.1** Logs & metrics
+  - **Structured JSON logs** — stdlib `logging` with a custom `JsonFormatter`. One JSON object per stdout line. Required fields (`timestamp`, `level`, `msg`, `request_id`) plus per-request extras (`method`, `path`, `status`, `duration_ms`).
+  - **Request ID middleware** — `before_request` reads `X-Request-ID` from the client (echo) or generates a fresh UUID4 hex; `after_request` writes it back on the response header and includes it in the log line. Stored on `flask.g` for the request scope.
+  - **`/metrics` endpoint** — Prometheus exposition format. Two app-level series (Counter, Histogram) labelled by matched URL rule (decision #27), `/metrics` excluded from itself.
+  - **gunicorn config file** at repo root — disables gunicorn's plain access log (we emit JSON from Flask) and runs the multiprocess cleanup hook. Decision #26.
+  - **Multiprocess metrics** via `prometheus_client.multiprocess` — `PROMETHEUS_MULTIPROC_DIR` env in the image, `mark_process_dead(worker.pid)` on `child_exit`, `MultiProcessCollector` per scrape. Helm chart mounts an `emptyDir` (`medium: Memory`, 16Mi) at the multiproc dir so rollouts reset cleanly. Decision #25.
+  - **Tests** — 7/7 pytest pass (up from 3): added coverage for `/metrics` response shape, `X-Request-ID` generation and round-trip, and `JsonFormatter` field shape.
+  - **Verified locally** — ruff clean, pytest green, Flask-dev smoke OK, gunicorn 2-worker smoke confirmed multiproc aggregation produces summed counters (`http_requests_total{path="/ping"} 10.0` after 10 requests against 2 workers, with both `counter_<pid>.db` files present in the multiproc dir).
+- ⬜ **4.2** Prometheus + Grafana — kube-prometheus-stack on minikube, ≥1 dashboard, ≥1 alert
+- ⬜ **4.3** IaC — Terraform/OpenTofu for EC2 + EIP + SG (scope of OIDC role/instance profile still open — see "Open questions")
+- ⬜ **4.4** Architecture & docs — RUNBOOK.md, SECURITY.md, ≥3 ADRs, architecture diagram
 
 ---
 
@@ -131,17 +144,18 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
 ├── .gitignore                     # python, secrets, macOS, IDE, .env (keeps .env.example)
 ├── CHANGELOG.md                   # Keep a Changelog format; tracks v0.1.0+ (Day 3)
 ├── Dockerfile                     # multi-stage, python:3.12-slim, non-root, HEALTHCHECK
+├── gunicorn.conf.py               # bind/workers + multiprocess cleanup + JSON-only logging (Day 4.1)
 ├── PROGRESS.md                    # This file
 ├── README.md                      # setup, run, container, helm, CI/CD, decisions
 ├── SETUP.md                       # Day 0 infra log
 ├── app.py                         # Flask: /ping, /healthz, /version
 ├── docker-compose.yaml            # local-dev convenience
 ├── pyproject.toml                 # ruff config (Day 3)
-├── requirements.txt               # flask==3.0.3, gunicorn==23.0.0
+├── requirements.txt               # flask==3.0.3, gunicorn==23.0.0, prometheus-client==0.21.0
 ├── requirements-dev.txt           # -r requirements.txt + pytest==8.3.3, ruff==0.7.4
 ├── scripts/
 │   └── deploy.sh                  # runs on EC2 via SSM after main merge (Day 3.4)
-├── test_app.py                    # 3 pytest tests covering all endpoints
+├── test_app.py                    # 7 pytest tests (endpoints, /metrics, request_id, JSON formatter)
 └── .venv/                         # gitignored, local python env
 ```
 
