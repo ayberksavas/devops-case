@@ -1,0 +1,32 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: app.rules
+      rules:
+        - alert: HighErrorRate
+          # Ratio of 5xx responses to total requests, over a 1-minute window.
+          # The `and` clause guards against div-by-zero when the service is
+          # idle (otherwise the expression would be NaN and never fire, but
+          # being explicit makes the intent clearer to anyone reading the rule).
+          expr: |
+            (
+              sum(rate(http_requests_total{status=~"5.."}[1m]))
+              /
+              sum(rate(http_requests_total[1m]))
+            ) > {{ .Values.monitoring.alerts.errorRateThreshold }}
+            and
+            sum(rate(http_requests_total[1m])) > 0
+          for: {{ .Values.monitoring.alerts.errorRateFor | quote }}
+          labels:
+            severity: warning
+            app: {{ include "app.name" . }}
+          annotations:
+            summary: "5xx error rate above {{ .Values.monitoring.alerts.errorRateThreshold }} on {{ include "app.fullname" . }}"
+            description: "Sustained 5xx rate has been above the threshold for {{ .Values.monitoring.alerts.errorRateFor }}."
+{{- end }}
