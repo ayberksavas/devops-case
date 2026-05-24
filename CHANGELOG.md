@@ -7,6 +7,35 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Structured JSON logs** — stdlib `logging` with a custom `JsonFormatter` emits
+  one JSON object per log line on stdout. Per-request access log carries
+  `timestamp`, `level`, `msg`, `request_id`, `method`, `path`, `status`, and
+  `duration_ms`. Log level configurable via `LOG_LEVEL` (default `INFO`).
+- **Request ID propagation** — every request gets an `X-Request-ID` (echoed
+  back from the client header if present, otherwise a fresh UUID4 hex). The
+  same value appears on the response header and in the access log line.
+- **`/metrics` endpoint** — Prometheus exposition format with two app-level
+  series: `http_requests_total{method,path,status}` (Counter) and
+  `http_request_duration_seconds{method,path}` (Histogram). The scrape endpoint
+  itself is excluded from these series.
+- **Gunicorn config file** (`gunicorn.conf.py`) — runs `prometheus_client`'s
+  `multiprocess.mark_process_dead` from the `child_exit` hook so per-worker
+  metric files don't leak counters from gone PIDs across rollouts. Also
+  disables gunicorn's plaintext access log (the Flask after-request hook emits
+  the structured JSON one).
+- **Helm chart** — `emptyDir` (`medium: Memory`, 16Mi) mounted at
+  `/tmp/prometheus_multiproc` so the multiprocess metric files survive across
+  worker restarts within the pod and reset cleanly on rollout.
+
+### Changed
+
+- **Dockerfile entrypoint** — now `gunicorn -c gunicorn.conf.py app:app`
+  (replaces the inline `--bind / --workers / --access-logfile` flags). New
+  env var `PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc` and the
+  directory is pre-created and chowned to `appuser` in the runtime image.
+
 ## [0.1.0] - 2026-05-23
 
 First tagged release. Covers Days 0–3 of the InsiderOne DevOps case study:

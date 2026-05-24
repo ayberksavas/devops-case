@@ -15,6 +15,11 @@ A minimal Flask service exposing three endpoints:
 | GET | `/ping` | `pong` (text/plain) |
 | GET | `/healthz` | `{"status":"ok"}` — used by Kubernetes probes |
 | GET | `/version` | `{"sha":"<BUILD_SHA>"}` — the SHA the image was built from |
+| GET | `/metrics` | Prometheus exposition format — request counter and latency histogram (Day 4) |
+
+Every request receives an `X-Request-ID` response header. If the request
+carries one in, it's echoed back; otherwise a fresh UUID4 hex is generated.
+The same value is included in the JSON access log line for that request.
 
 ### Environment variables
 
@@ -24,6 +29,9 @@ See [`.env.example`](./.env.example).
 |----------|---------|---------|
 | `PORT` | `8080` | Port the service listens on |
 | `BUILD_SHA` | `dev` | Returned by `/version`; set to the git commit SHA at image build time |
+| `LOG_LEVEL` | `INFO` | Root logger level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `PROMETHEUS_MULTIPROC_DIR` | `/tmp/prometheus_multiproc` (set in the image) | Where `prometheus_client` writes per-worker mmap files. Don't override unless you also mount a writable path there. |
+| `WEB_CONCURRENCY` | `2` | Gunicorn worker count (read by `gunicorn.conf.py`) |
 
 ## Running locally
 
@@ -62,7 +70,11 @@ curl localhost:8080/version  # → {"sha":"..."}
 - Multi-stage build: `python:3.12-slim` builder → `python:3.12-slim` runtime
 - Runs as non-root `appuser` (uid 1000) with `/usr/sbin/nologin`
 - `HEALTHCHECK` uses Python stdlib (no curl/wget shipped in the image)
-- Entrypoint: `gunicorn` with 2 workers
+- Entrypoint: `gunicorn -c gunicorn.conf.py app:app` — the config file pins
+  bind/workers, disables gunicorn's plaintext access log (Flask emits a
+  JSON one), and wires the `prometheus_client` multiprocess cleanup hook
+- `/tmp/prometheus_multiproc` is created and chowned to `appuser` in the
+  image for the multiprocess metric files (see [Observability](#observability))
 
 ## Architecture (current)
 
@@ -77,7 +89,7 @@ client ──HTTP──▶ Ingress (nginx) ──▶ Service (ClusterIP) ──�
                               └────────────────────────────────────────┘
 ```
 
-Day 2 added the Helm-managed Kubernetes layer (see below). Day 3 added the CI/CD pipeline that lints, tests, scans, and publishes the image to GHCR (see CI/CD section). Observability (Prometheus + Grafana) lands on Day 4.
+Day 2 added the Helm-managed Kubernetes layer (see below). Day 3 added the CI/CD pipeline that lints, tests, scans, and publishes the image to GHCR (see CI/CD section). Day 4.1 added the app-side observability surface — JSON logs, request IDs, and a `/metrics` endpoint (see [Observability](#observability)); kube-prometheus-stack and Grafana land in 4.2.
 
 ## Kubernetes (Helm)
 
@@ -313,6 +325,82 @@ GitOps becomes the right answer in a multi-app, multi-team context. For one Flas
 - Repo variables: `EC2_INSTANCE_ID` (in addition to `AWS_ROLE_ARN`, `AWS_REGION` from 3.2).
 - The repo is cloned once at `/opt/devops-case` on EC2, owned by `ubuntu`. Subsequent deploys `git fetch && reset --hard origin/main`.
 
+## Observability
+
+### Structured JSON logs
+
+The app emits one JSON object per log line on stdout. A custom
+`JsonFormatter` (stdlib `logging`, no extra dep) covers the fields the
+case study asks for plus a few that are useful in practice:
+
+```json
+{
+  "timestamp": "2026-05-24T08:33:07.228Z",
+  "level": "INFO",
+  "msg": "request",
+  "request_id": "869983147f8d48678d5dd10a696cdd26",
+  "method": "GET",
+  "path": "/ping",
+  "status": 200,
+  "duration_ms": 0.08
+}
+```
+
+`path` is the *matched URL rule* (`/ping`, `/healthz`, `/version`,
+`/metrics`), not the raw request path — so an unknown URL with arbitrary
+noise can't blow up log/metric cardinality.
+
+Gunicorn's own access log is disabled in `gunicorn.conf.py`; the Flask
+`after_request` hook is the single source of access lines.
+
+### `/metrics` endpoint
+
+Two application metrics in Prometheus exposition format, in addition to
+the default Python process metrics:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `http_requests_total` | Counter | `method`, `path`, `status` |
+| `http_request_duration_seconds` | Histogram | `method`, `path` |
+
+The `/metrics` endpoint itself is excluded from the counters, so a
+Prometheus scrape doesn't bias its own series.
+
+### Multiprocess metrics with gunicorn
+
+Gunicorn runs 2 workers. Each worker keeps its own in-memory metric
+state — so without coordination, a scrape would hit one worker at random
+and report flickering totals. The standard fix is `prometheus_client`'s
+multiprocess mode:
+
+- `PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc` is set in the
+  image; each worker writes its counters to an mmap file there.
+- `gunicorn.conf.py`'s `child_exit` hook calls
+  `prometheus_client.multiprocess.mark_process_dead(worker.pid)` so a
+  gone worker's file is no longer aggregated as live.
+- The `/metrics` handler instantiates a fresh `CollectorRegistry` per
+  request and adds a `MultiProcessCollector` that reads every worker's
+  file and sums them.
+- In Kubernetes, the chart mounts an `emptyDir` (`medium: Memory`, 16Mi)
+  on top of `/tmp/prometheus_multiproc`. `emptyDir` resets with the pod,
+  which is the desired behaviour: a rollout = a clean counter slate.
+
+### Local verification
+
+```bash
+# In one shell — start gunicorn with multiproc enabled
+mkdir -p /tmp/prom_local
+PROMETHEUS_MULTIPROC_DIR=/tmp/prom_local \
+  gunicorn -c gunicorn.conf.py app:app
+
+# In another shell
+for i in $(seq 1 10); do curl -sS http://127.0.0.1:8080/ping >/dev/null; done
+curl -sS http://127.0.0.1:8080/metrics | grep -E '^http_'
+```
+
+The `http_requests_total{...path="/ping"...}` line should sum to 10
+across both workers.
+
 ## Project status
 
 See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progress.
@@ -329,6 +417,7 @@ See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progres
 - **Why `:latest` tracks releases, not `main`**: registry convention is that `:latest` means "latest released version", not "latest commit". Main commits are addressable via `:main` and `:<short-sha>`. Setting `:latest` only on `github.ref_type == 'tag'` enforces the convention.
 - **Why CI-push deploy via SSM (not ArgoCD/Flux GitOps)**: see the [Auto-deploy on merge](#auto-deploy-on-merge) table. Short version: we already built the OIDC machinery for 3.2, so deploy adds one IAM policy + one workflow job. ArgoCD is the right answer at multi-app multi-team scale; here it would add ~500 MiB on a 4 GiB EC2 plus a control plane to manage, for marginal benefit on one Flask app.
 - **Why the EC2 holds a checkout of the repo at `/opt/devops-case`** (instead of CI rendering manifests and shipping them via SSM): rendered Helm output is bigger than the 4 KiB SSM inline-command limit. The alternatives are an S3 hop or compressing the YAML, both of which add moving parts. A `git fetch && reset --hard origin/main` on the EC2 is one network round-trip and keeps the deploy script tiny.
+- **Why `prometheus_client` multiprocess mode (not 1 gunicorn worker, not per-worker drift)**: gunicorn runs 2 workers (production-realistic; locked on Day 1). With each worker holding its own counters, a Prometheus scrape would see flickering numbers and the Day 4.2 dashboards (RPS, error rate) would be useless. Multiprocess mode is the canonical fix — ~30 lines split across `gunicorn.conf.py` (a `child_exit` hook), an `emptyDir` volume in the chart, and one env var in the image. Dropping to 1 worker would reverse a documented prior decision and lose any concurrency story; living with drift would make the dashboards lie.
 
 Full ADRs land on Day 4 under `docs/adr/`.
 

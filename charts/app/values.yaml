@@ -104,8 +104,18 @@ readinessProbe:
 autoscaling:
   enabled: false
 
-volumes: []
-volumeMounts: []
+# emptyDir for prometheus_client's multiprocess mode. Each gunicorn worker
+# writes mmap files for its metric counters here; the /metrics handler reads
+# them all back via MultiProcessCollector. emptyDir is fine — these counters
+# reset with the pod, which is what we want (deploy = clean slate).
+volumes:
+  - name: prometheus-multiproc
+    emptyDir:
+      medium: Memory
+      sizeLimit: 16Mi
+volumeMounts:
+  - name: prometheus-multiproc
+    mountPath: /tmp/prometheus_multiproc
 
 nodeSelector: {}
 tolerations: []
