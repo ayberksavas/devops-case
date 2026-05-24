@@ -130,6 +130,61 @@ curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
 ---
 
+## Phase 4 — Host-level port forwarding (post-Day 4)
+
+Discovered after the main flow was complete: with the `docker` driver, **minikube doesn't bind to the EC2 host's port 80**. Its ingress controller listens inside the minikube docker network (at `192.168.49.2:80`), reachable from the EC2 host itself but **not** from outside via the Elastic IP. The public URL (`http://<EIP>/ping`) returned `connection refused` even though the cluster was healthy.
+
+Two options to fix: switch minikube to the `none` driver (binds directly to the host, but invasive to a working setup) or add a host-level TCP forwarder. Chose the forwarder.
+
+### `socat` + systemd unit
+
+```bash
+sudo apt-get install -y socat
+
+sudo tee /etc/systemd/system/minikube-ingress-proxy.service > /dev/null <<'UNIT'
+[Unit]
+Description=Forward EC2:80 to minikube ingress
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP-LISTEN:80,fork,reuseaddr TCP:192.168.49.2:80
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now minikube-ingress-proxy
+```
+
+**What this gets you:**
+
+- `EC2:80` (reachable through the Elastic IP) → `192.168.49.2:80` (minikube ingress).
+- `Restart=always` revives `socat` if it crashes; the unit also restarts automatically across EC2 reboots once minikube is up.
+- The minikube IP is hardcoded as `192.168.49.2` — this is the docker driver's stable default and only changes if you `minikube delete && minikube start`.
+
+### Why hardcode the IP instead of `$(minikube ip)`
+
+The systemd unit runs as `root`. `minikube ip` reads from `$HOME/.minikube/`, which for root is `/root/.minikube/` — empty. Running `minikube ip` as root either fails or returns nothing, so an `ExecStartPre` polling loop hangs forever. Hardcoding `192.168.49.2` sidesteps the user/HOME mismatch with no downside in practice.
+
+### EC2 stop/start recovery
+
+On a fresh boot:
+
+1. Docker auto-starts (systemd, enabled by default).
+2. `minikube-ingress-proxy` tries to start — fails because `192.168.49.2:80` isn't reachable yet (no minikube).
+3. SSH in and run `minikube start`. Existing cluster state comes back (Deployments, Services, etc.).
+4. Within ~10 seconds the proxy's `Restart=always` brings socat back up. URL is reachable again.
+
+Only manual step on a fresh boot: `minikube start`.
+
+---
+
 ## Current Status
 
 | Component | Status |
@@ -141,5 +196,6 @@ curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 | kubectl | ✅ v1.36.1 |
 | minikube | ✅ Running (1 node, Ready) |
 | Helm | ✅ Installed |
+| `minikube-ingress-proxy` systemd unit | ✅ Active (post-Day 4) — bridges EC2:80 → minikube ingress |
 
 **Next step:** Write the HTTP service (Day 1 — Task 1.1).
