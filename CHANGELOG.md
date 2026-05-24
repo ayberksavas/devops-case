@@ -93,6 +93,40 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   (immutable in AWS, set by the launch wizard); `lifecycle.ignore_changes`
   on the EC2's `ami` to prevent accidental host recreation.
 
+### Added (Day 4.4 — Architecture & docs)
+
+- **Architecture diagram** — Mermaid block in `README.md` replacing the
+  earlier ASCII art. Shows the runtime topology end-to-end: client →
+  Elastic IP → nginx Ingress → Service → 2 app pods, with the
+  observability overlay (Prometheus scraping pods, Grafana querying
+  Prometheus, Alertmanager) wired in. Renders inline on GitHub.
+- **`RUNBOOK.md`** — one-page operator's guide. Restart procedures
+  (pod / deployment / minikube), log access (kubectl / Grafana /
+  Prometheus / CI), rollback (Helm + Terraform), secret rotation
+  (`DEMO_TOKEN`, Grafana admin, OIDC role), and a catalogue of common
+  failure modes with fixes.
+- **`SECURITY.md`** — security posture summary: threat model, secret
+  handling (gitleaks + manual privacy sweep), authn/authz (OIDC
+  federation, no long-lived AWS keys), network exposure (per-port
+  source CIDRs), supply chain (Trivy gating), pod security (non-root,
+  no-priv-esc, dropped capabilities). Includes a production-hardening
+  roadmap and a public-vulnerability-reporting process.
+- **`docs/adr/`** — three Architecture Decision Records in Michael
+  Nygard's standard format:
+  - `0001-track-a-minikube-on-ec2.md` — Track A choice over local +
+    tunnel; rationale for AWS exposure and a stable public URL.
+  - `0002-ci-push-deploy-via-oidc-ssm.md` — auto-deploy from GitHub
+    Actions over GitOps (ArgoCD/Flux), reusing the existing OIDC
+    trust to avoid a 500 MiB cluster controller on a 4 GiB host.
+  - `0003-kube-prometheus-stack.md` — operator-bundled observability
+    stack with a slim values profile.
+  - Plus an `docs/adr/README.md` index page documenting the
+    convention (ADR vs PROGRESS decision-log; immutability;
+    superseding).
+- **README cross-links** — new `## Operations` and `## Architecture
+  decisions (ADRs)` sections in the main README pointing at the new
+  files.
+
 ## [0.1.0] - 2026-05-23
 
 First tagged release. Covers Days 0–3 of the InsiderOne DevOps case study:

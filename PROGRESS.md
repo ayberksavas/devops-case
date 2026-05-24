@@ -133,7 +133,16 @@ Chosen for AWS exposure. See `SETUP.md` for the full infra log (EC2 type, securi
   - **`lifecycle.ignore_changes`**: `[ami]` on the EC2 (guards against accidental host recreation if `var.ami_id` drifts), `[description, tags, tags_all]` on the SG (description is immutable in AWS; tags hands-off post-alignment). Decision #37.
   - **Local state, no S3 backend** — PDF says local is fine for a one-person project; team setting would use S3 + DynamoDB lock. Decision #38.
   - **Verified on AWS** — `tofu apply` succeeded with `0 added, 3 changed, 0 destroyed`; subsequent `tofu plan` output: *"No changes. Your infrastructure matches the configuration."* Output values (`public_ip`, `instance_id`, `security_group_id`) match the live resources — IDs intentionally omitted from this doc.
-- ⬜ **4.4** Architecture & docs — RUNBOOK.md, SECURITY.md, ≥3 ADRs, architecture diagram
+- ✅ **4.4** Architecture & docs
+  - **Architecture diagram** — Mermaid block inline in `README.md` (replaces the earlier ASCII art). Shows runtime topology end-to-end: client → EIP → nginx Ingress → Service → 2 app pods, plus the observability overlay (Prometheus scraping pods, Grafana, Alertmanager). Blue nodes = application; orange = observability; dashed arrows = information flow (scrape / envFrom / queries / alerts); solid = request flow.
+  - **`RUNBOOK.md`** — one-page operator guide: restart procedures (pod / deployment / minikube), log access (kubectl / Grafana / Prometheus / CI), rollback (`helm rollback` + Terraform state-file backup), secret rotation (`DEMO_TOKEN`, Grafana admin, OIDC role — explicitly noting *no AWS access keys to rotate*), and a catalogue of common failure modes with fixes.
+  - **`SECURITY.md`** — threat model summary, secret-handling posture, authn/authz (OIDC federation, root-on-laptop trade-off documented), network exposure (per-port source CIDRs), supply chain (Trivy gating + cosign/SBOM on roadmap), pod security (non-root uid 1000, `runAsNonRoot`, all caps dropped). Includes a private-vulnerability-reporting flow via GitHub Security Advisories, and a numbered production-hardening roadmap.
+  - **3 ADRs** under `docs/adr/`, Nygard format (`Status / Context / Decision / Consequences`), each with explicit alternatives and trade-offs:
+    - `0001-track-a-minikube-on-ec2.md` — Track A over local + tunnel.
+    - `0002-ci-push-deploy-via-oidc-ssm.md` — OIDC + SSM over GitOps.
+    - `0003-kube-prometheus-stack.md` — slim-profile operator bundle.
+  - **`docs/adr/README.md` index** — table of records + convention notes (when to write an ADR vs add to PROGRESS decision log; ADR immutability; superseding).
+  - **README cross-links** — new `## Operations` (RUNBOOK + SECURITY) and `## Architecture decisions (ADRs)` sections so reviewers can navigate from the front door.
 
 ---
 
@@ -171,6 +180,12 @@ devops-case/                       # repo root
 │   ├── day0-checkpoint.pdf        # EC2 + SG + tool versions evidence (redacted)
 │   ├── day1-checkpoint.pdf        # docker build/run/curl + non-root + git log + secret scan
 │   └── day2-checkpoint.pdf        # dev install, prod install, resources, rollout, rollback
+├── docs/
+│   └── adr/                       # Architecture Decision Records (Day 4.4)
+│       ├── README.md              # index + conventions
+│       ├── 0001-track-a-minikube-on-ec2.md
+│       ├── 0002-ci-push-deploy-via-oidc-ssm.md
+│       └── 0003-kube-prometheus-stack.md
 ├── .dockerignore
 ├── .env.example                   # PORT, BUILD_SHA
 ├── .gitignore                     # python, secrets, macOS, IDE, .env (keeps .env.example)
@@ -178,7 +193,9 @@ devops-case/                       # repo root
 ├── Dockerfile                     # multi-stage, python:3.12-slim, non-root, HEALTHCHECK
 ├── gunicorn.conf.py               # bind/workers + multiprocess cleanup + JSON-only logging (Day 4.1)
 ├── PROGRESS.md                    # This file
-├── README.md                      # setup, run, container, helm, CI/CD, decisions
+├── README.md                      # setup, run, container, helm, CI/CD, observability, IaC, decisions
+├── RUNBOOK.md                     # one-page operator guide (Day 4.4)
+├── SECURITY.md                    # security posture + threat model + reporting (Day 4.4)
 ├── SETUP.md                       # Day 0 infra log
 ├── app.py                         # Flask: /ping, /healthz, /version
 ├── docker-compose.yaml            # local-dev convenience

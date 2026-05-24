@@ -78,20 +78,84 @@ curl localhost:8080/version  # → {"sha":"..."}
 - `/tmp/prometheus_multiproc` is created and chowned to `appuser` in the
   image for the multiprocess metric files (see [Observability](#observability))
 
-## Architecture (current)
+## Architecture
 
-```
-                              ┌────────────────────────────────────────┐
-                              │  minikube (single node, on EC2)        │
-                              │                                        │
-client ──HTTP──▶ Ingress (nginx) ──▶ Service (ClusterIP) ──▶ Pod(s) ──▶ gunicorn → flask app.py
-                              │                            │           │
-                              │                ConfigMap (BUILD_SHA) ──┤
-                              │                Secret (DEMO_TOKEN)  ───┤
-                              └────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    Client((Client))
+
+    subgraph EC2 [EC2 host - eu-north-1 - c7i-flex.large]
+        EIP[Elastic IP]
+
+        subgraph minikube [minikube - single node]
+            Ing[nginx Ingress]
+
+            subgraph appns [default namespace - app chart]
+                Svc[Service<br/>ClusterIP :80]
+                Pod1[[Pod 1<br/>gunicorn to flask]]
+                Pod2[[Pod 2<br/>gunicorn to flask]]
+                CM[(ConfigMap<br/>BUILD_SHA)]
+                Sec[(Secret<br/>DEMO_TOKEN)]
+            end
+
+            subgraph monns [monitoring namespace - kube-prometheus-stack]
+                Prom[Prometheus]
+                Graf[Grafana]
+                AM[Alertmanager]
+            end
+
+            Ing --> Svc
+            Svc --> Pod1
+            Svc --> Pod2
+            CM -.->|envFrom| Pod1
+            CM -.->|envFrom| Pod2
+            Sec -.->|envFrom| Pod1
+            Sec -.->|envFrom| Pod2
+
+            Prom -.->|scrape /metrics| Pod1
+            Prom -.->|scrape /metrics| Pod2
+            Graf -.->|queries| Prom
+            Prom -.->|alerts| AM
+        end
+
+        EIP --> Ing
+    end
+
+    Client -->|HTTP/HTTPS| EIP
+
+    classDef obs fill:#fff4e6,stroke:#d4a017,stroke-width:2px,color:#1a1a1a
+    classDef app fill:#e7f5ff,stroke:#1971c2,stroke-width:2px,color:#1a1a1a
+    class Prom,Graf,AM obs
+    class Pod1,Pod2,Svc app
 ```
 
-Day 2 added the Helm-managed Kubernetes layer (see below). Day 3 added the CI/CD pipeline that lints, tests, scans, and publishes the image to GHCR (see CI/CD section). Day 4.1 added the app-side observability surface — JSON logs, request IDs, and a `/metrics` endpoint. Day 4.2 added the cluster-side observability stack — Prometheus, Alertmanager, Grafana, and a `ServiceMonitor` so the app's metrics get scraped (see [Observability](#observability)).
+The diagram is rendered inline by GitHub. The blue nodes are the application
+(`Service`, two pods running `gunicorn` → `flask`); the orange nodes are the
+observability overlay added on Day 4.2. Dashed arrows are *information flow*
+(scrape, envFrom, alerts, queries); solid arrows are *request flow*.
+
+**How the layers landed:**
+
+- **Day 1** — the app (Flask + gunicorn), its container, the repo hygiene.
+- **Day 2** — the Helm chart wraps Deployment / Service / Ingress /
+  ConfigMap / Secret around the container.
+- **Day 3** — CI/CD pipeline builds and publishes the image to GHCR,
+  scans with Trivy, and (3.4) auto-deploys to the cluster via OIDC + SSM
+  after every merge to `main`.
+- **Day 4.1** — the app emits JSON logs to stdout and exposes
+  `/metrics` in Prometheus exposition format (`http_requests_total`
+  Counter, `http_request_duration_seconds` Histogram).
+- **Day 4.2** — `kube-prometheus-stack` installed in the `monitoring`
+  namespace; the app chart ships a `ServiceMonitor` so Prometheus
+  scrapes both pods, a `PrometheusRule` (`HighErrorRate`), and a
+  labelled `ConfigMap` carrying the Grafana dashboard.
+- **Day 4.3** — the EC2, EIP, and SG from Day 0 are codified in
+  OpenTofu (`infra/`); `tofu plan` is empty against the live
+  infrastructure.
+
+For operational guidance see [`RUNBOOK.md`](./RUNBOOK.md). For the
+security model see [`SECURITY.md`](./SECURITY.md). For the major
+architectural decisions, see [`docs/adr/`](./docs/adr/).
 
 ## Kubernetes (Helm)
 
@@ -644,6 +708,28 @@ contract that you'd run before any change to know what `apply` would do.
 ## Project status
 
 See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progress.
+
+## Operations
+
+- [`RUNBOOK.md`](./RUNBOOK.md) — one-page operator's guide. Restart, log
+  access, rollback, secret rotation, common failure modes.
+- [`SECURITY.md`](./SECURITY.md) — security model, secret-handling
+  posture, IAM scoping, network exposure, supply chain, and a roadmap
+  for production hardening.
+
+## Architecture decisions (ADRs)
+
+For the load-bearing decisions, full ADRs live under
+[`docs/adr/`](./docs/adr/) in Michael Nygard's `Status / Context /
+Decision / Consequences` format:
+
+- [ADR 0001 — Track A: Minikube on EC2](./docs/adr/0001-track-a-minikube-on-ec2.md)
+- [ADR 0002 — CI-push deploy via OIDC + SSM](./docs/adr/0002-ci-push-deploy-via-oidc-ssm.md)
+- [ADR 0003 — Observability via kube-prometheus-stack (slim)](./docs/adr/0003-kube-prometheus-stack.md)
+
+The smaller-grained numbered decision log (#1+) is in
+[`PROGRESS.md`](./PROGRESS.md) — that's the authoritative list when an
+ADR and a decision bullet disagree.
 
 ## Decisions (so far)
 
