@@ -25,7 +25,16 @@ spec:
   {{- end }}
   rules:
     {{- range .Values.ingress.hosts }}
-    - host: {{ .host | quote }}
+    -
+      {{- /*
+        Omit `host:` entirely when the value is empty, which makes the rule a
+        catch-all matching any Host header (per k8s Ingress spec). Used in
+        values-prod.yaml so the public Elastic IP responds in a browser
+        without a Host header tweak.
+      */}}
+      {{- if .host }}
+      host: {{ .host | quote }}
+      {{- end }}
       http:
         paths:
           {{- range .paths }}

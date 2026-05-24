@@ -6,7 +6,16 @@ replicaCount: 2
 
 ingress:
   hosts:
+    # Named host — canonical access via /etc/hosts + the Elastic IP.
     - host: devops-case.local
+      paths:
+        - path: /
+          pathType: Prefix
+    # Catch-all rule (no host field, see ingress.yaml template). Lets the
+    # public Elastic IP serve requests from a browser that sends
+    # Host: 51.20.222.243 — i.e., the submission demo URL works in a
+    # raw browser click, not just curl with -H "Host: ...".
+    - host: ""
       paths:
         - path: /
           pathType: Prefix
