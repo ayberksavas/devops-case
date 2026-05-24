@@ -1,0 +1,19 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  # Match the Service this chart creates. The Service carries
+  # app.labels (which includes selectorLabels), so matching on the
+  # selector subset is precise and stable across releases.
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: {{ .Values.monitoring.serviceMonitor.path | quote }}
+      interval: {{ .Values.monitoring.serviceMonitor.interval | quote }}
+{{- end }}

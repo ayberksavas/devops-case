@@ -1,0 +1,132 @@
+# Slim profile for kube-prometheus-stack on a 4 GiB EC2 (Track A).
+#
+# Default install reserves ~2 GiB just for Prometheus plus Grafana, Alertmanager,
+# the operator, node-exporter, and kube-state-metrics — that would OOM the EC2
+# alongside minikube + the app + Linux overhead. Each override here is annotated
+# with what's being given up so the trade-offs are explicit.
+
+# ---- Prometheus operator ----------------------------------------------------
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 30m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# ---- Prometheus server ------------------------------------------------------
+
+prometheus:
+  prometheusSpec:
+    # Pick up ServiceMonitors / PodMonitors / PrometheusRules regardless of
+    # label selector. With a single-app cluster this is simpler than juggling
+    # release-label filters; the default behaviour of the chart filters by
+    # `release: <release-name>` which would silently drop our app's
+    # ServiceMonitor.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+
+    # 2-day retention — enough to see trends across a working day without
+    # storing weeks of TSDB on emptyDir. Trade-off: a pod restart wipes
+    # history, which is fine for a demo cluster.
+    retention: 2d
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 250Mi
+      limits:
+        cpu: 500m
+        memory: 600Mi
+
+    # No PersistentVolumeClaim — TSDB lives in the pod's emptyDir. On rollout
+    # or restart, history resets. Acceptable on a demo cluster; in real prod
+    # you'd back this with a PVC.
+
+# ---- Alertmanager -----------------------------------------------------------
+
+alertmanager:
+  alertmanagerSpec:
+    retention: 24h
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+
+# ---- Grafana ----------------------------------------------------------------
+
+grafana:
+  # Demo-only admin password. Grafana is reached via `kubectl port-forward`,
+  # not exposed through the public ingress — no auth scheme worth speaking of.
+  adminPassword: admin
+
+  persistence:
+    enabled: false
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 80Mi
+    limits:
+      cpu: 200m
+      memory: 192Mi
+
+  sidecar:
+    dashboards:
+      enabled: true
+      # Discover dashboard ConfigMaps in any namespace, not just the
+      # monitoring release namespace. Lets the app chart in `default` ship
+      # its own dashboard ConfigMap without copying it into `monitoring`.
+      searchNamespace: ALL
+      label: grafana_dashboard
+      labelValue: "1"
+
+# ---- node-exporter ----------------------------------------------------------
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 32Mi
+
+# ---- kube-state-metrics (needed for pod-restart metric) --------------------
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# ---- Default rules ---------------------------------------------------------
+#
+# Disable rules for control-plane components that minikube doesn't expose.
+# These would generate noisy "target down" alerts otherwise.
+
+defaultRules:
+  rules:
+    kubeControllerManager: false
+    kubeScheduler: false
+    kubeProxy: false
+    etcd: false
+
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false

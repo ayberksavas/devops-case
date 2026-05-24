@@ -1,0 +1,15 @@
+{{- if .Values.monitoring.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "app.fullname" . }}-dashboard
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+    # Picked up by kube-prometheus-stack's Grafana sidecar (searchNamespace: ALL
+    # in monitoring/values.yaml). Any namespace, any ConfigMap with this label
+    # gets loaded as a dashboard.
+    grafana_dashboard: "1"
+data:
+  app-overview.json: |
+    {{- .Files.Get "dashboards/app-overview.json" | nindent 4 }}
+{{- end }}

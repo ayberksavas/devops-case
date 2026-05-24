@@ -10,3 +10,9 @@ ingress:
       paths:
         - path: /
           pathType: Prefix
+
+# Day 4.2: ServiceMonitor + PrometheusRule + dashboard ConfigMap are rendered
+# only in prod, where the kube-prometheus-stack is installed (see
+# scripts/install-monitoring.sh + monitoring/values.yaml).
+monitoring:
+  enabled: true

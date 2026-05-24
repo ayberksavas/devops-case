@@ -104,6 +104,21 @@ readinessProbe:
 autoscaling:
   enabled: false
 
+# Day 4.2: monitoring resources rendered only when the kube-prometheus-stack
+# CRDs are installed on the cluster. Default off so `helm install` still works
+# on a fresh cluster (CRD-free). values-prod.yaml flips this on.
+monitoring:
+  enabled: false
+  # PrometheusRule alert thresholds. Lowering `errorRateThreshold` for a demo
+  # makes the alert easier to fire; production would want a much smaller value.
+  alerts:
+    errorRateThreshold: 0.05  # 5% — matches the PDF's example
+    errorRateFor: 5m
+  # ServiceMonitor scrape settings.
+  serviceMonitor:
+    interval: 15s
+    path: /metrics
+
 # emptyDir for prometheus_client's multiprocess mode. Each gunicorn worker
 # writes mmap files for its metric counters here; the /metrics handler reads
 # them all back via MultiProcessCollector. emptyDir is fine — these counters
