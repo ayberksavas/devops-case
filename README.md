@@ -2,6 +2,8 @@
 
 A small HTTP service shipped end-to-end like production: container → Kubernetes (Helm) → CI/CD → observability → public URL.
 
+> **About this doc**: `README.md` is the public-facing how-to and rationale — the steady-state guide for anyone landing on the repo cold. For *live* project state — checklist of done/pending tasks, the numbered decision log with alternatives explicitly considered, the working-directory tree, and the open-questions list — see [`PROGRESS.md`](./PROGRESS.md). When the two diverge on a decision, PROGRESS is the authoritative log; README is the polished prose.
+
 ## Track
 
 **Track A — Minikube on EC2.** See [`SETUP.md`](./SETUP.md) for the full infra setup log (EC2 type, security group, software install).
@@ -500,6 +502,145 @@ unauthenticated dashboard on the internet. The port-forward + SSH tunnel
 pattern means access is gated by EC2 SSH keys, which already exist and
 already enforce a per-IP allowlist on the security group.
 
+## Infrastructure as Code (Day 4.3)
+
+The Day 0 AWS surface (EC2, Elastic IP, security group) is described in
+OpenTofu / Terraform configuration under [`infra/`](./infra). The PDF
+explicitly scopes Day 4.3 to *"defining the EC2, EIP, and security group
+with Terraform or OpenTofu"*; that's exactly what this directory does.
+IAM resources from Day 3 (OIDC provider, role, instance profile,
+`DeployViaSSM` inline policy) remain documented manual setup — codifying
+them was an explicit option but adds defense surface with no PDF
+requirement.
+
+### File layout
+
+```
+infra/
+├── versions.tf                 # required_version >= 1.5, aws ~> 5.70 provider pin
+├── variables.tf                # region, instance_type, ami_id, ssh_allowed_cidr, ...
+├── main.tf                     # data.aws_vpc.default + SG + EC2 + EIP
+├── outputs.tf                  # instance_id, public_ip, security_group_id
+├── terraform.tfvars.example    # committed; the real terraform.tfvars is gitignored
+├── .gitignore                  # .terraform/, *.tfstate*, terraform.tfvars
+└── .terraform.lock.hcl         # provider version pin (committed so installs are reproducible)
+```
+
+### Tool: OpenTofu (not Terraform)
+
+OpenTofu is the open-source fork of Terraform under the Linux Foundation,
+created after Hashicorp re-licensed Terraform under the BUSL in 2023. The
+HCL syntax is identical — every file in `infra/` works unchanged with
+either `tofu` or `terraform` CLIs. For a personal project there's no
+reason to depend on a BUSL-licensed binary when the community fork is
+drop-in compatible.
+
+### Install OpenTofu
+
+```bash
+# Ubuntu (EC2)
+curl --proto '=https' --tlsv1.2 -fsSL https://get.opentofu.org/install-opentofu.sh \
+  | sudo sh -s -- --install-method deb
+
+# macOS
+brew install opentofu
+```
+
+### Why `import`, not `apply`
+
+The EC2, EIP, and SG already exist (created manually on Day 0). Running
+`tofu apply` against a fresh configuration would *try to create new
+resources* — there's no `apply --adopt` flag. The correct flow is
+`tofu import` to bring the live resources into Terraform's local state
+without changing AWS, then iterate on the `.tf` files until `tofu plan`
+shows no changes.
+
+`scripts/terraform-import.sh` automates this for the 3 resources. It
+is idempotent — re-running on already-imported resources is a no-op.
+
+### Import + reconcile
+
+```bash
+# 1. Fill in the two required values (file is gitignored)
+cd infra
+cp terraform.tfvars.example terraform.tfvars
+#   edit terraform.tfvars: ami_id (from the running EC2) and ssh_allowed_cidr
+#                          (your home /32; can be read from the live SG)
+
+# 2. Initialise the working directory
+tofu init
+cd ..
+
+# 3. Discover IDs (from a machine with AWS creds + ec2:Describe* permissions)
+EC2_INSTANCE_ID=$(aws ec2 describe-instances --region eu-north-1 \
+  --filters 'Name=tag:Name,Values=devops-case' 'Name=instance-state-name,Values=running' \
+  --query 'Reservations[].Instances[].InstanceId' --output text)
+EIP_ALLOC=$(aws ec2 describe-addresses --region eu-north-1 \
+  --query "Addresses[?InstanceId=='$EC2_INSTANCE_ID'].AllocationId" --output text)
+SG_ID=$(aws ec2 describe-instances --region eu-north-1 \
+  --instance-ids "$EC2_INSTANCE_ID" \
+  --query 'Reservations[].Instances[].SecurityGroups[].GroupId' --output text)
+
+# 4. Import
+EC2_INSTANCE_ID="$EC2_INSTANCE_ID" EIP_ALLOC="$EIP_ALLOC" SG_ID="$SG_ID" \
+  bash scripts/terraform-import.sh
+
+# 5. Plan + apply (apply was needed once to align metadata; see "Why apply was needed once" below)
+cd infra && tofu plan
+tofu apply
+
+# 6. Verify the IaC is now a faithful description of reality
+tofu plan
+# expect: "No changes. Your infrastructure matches the configuration."
+```
+
+### Why `apply` was needed once
+
+After import, `tofu plan` showed three small metadata diffs:
+
+1. **EIP** — no tags on the live resource; `main.tf` declares `Name` and
+   `Project` tags.
+2. **EC2** — `Project` tag missing; live had only `Name`.
+3. **SG** — egress and ingress rules had empty descriptions; `main.tf`
+   declares human-readable ones (`"SSH from home"`, `"HTTP - public ingress to minikube"`, etc).
+
+These are all in-place metadata updates — no destroys, no recreates, no
+rule changes (SG rule revoke+authorize during description updates is
+transparent to existing TCP connections). One `tofu apply` aligned live
+to config; subsequent `tofu plan` is empty.
+
+### Quirks worth knowing
+
+- **`aws_eip_association` does not work for VPC EIPs** in the modern AWS
+  provider (errors with *"with the retirement of EC2-Classic standard
+  domain EC2 EIPs are no longer supported"* at import time). The
+  workaround used here is to bind the EIP to the instance's primary
+  network interface directly on the `aws_eip` resource:
+  `network_interface = aws_instance.minikube.primary_network_interface_id`.
+- **SG name `launch-wizard-3`** — the SG was created by the EC2 launch
+  wizard on Day 0 and got the auto-generated name. `main.tf` matches it
+  rather than renaming, because renaming a SG is a destroy/recreate,
+  which would detach from the running EC2 (network outage). Cosmetic
+  cleanup, not worth the risk on a live host.
+- **`lifecycle.ignore_changes = [ami]` on the EC2** — guards against an
+  accidental host recreation if `var.ami_id` ever drifts. A recreate
+  would destroy minikube state, the `/opt/devops-case` checkout, and
+  the SSM-managed deploy plumbing. Human action required for AMI
+  changes.
+- **`lifecycle.ignore_changes = [description, tags, tags_all]` on the SG** —
+  the SG description is immutable in AWS (can't be changed without
+  recreating the SG); tags are also ignored so the chart stays
+  intentionally hands-off after the initial alignment apply.
+- **Local state, no S3 backend** — single-person project; in a team
+  setting state would live in S3 with a DynamoDB lock table.
+
+### What `tofu plan` proves
+
+A clean `tofu plan` (no changes) is the proof that the `.tf` faithfully
+describes the live infrastructure. It's not a "deployment" — nothing
+gets pushed. It's the "infrastructure passes its own description"
+contract that you'd run before any change to know what `apply` would do.
+
 ## Project status
 
 See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progress.
@@ -522,6 +663,13 @@ See [`PROGRESS.md`](./PROGRESS.md) for the live task list and day-by-day progres
 - **Why monitoring resources live in the app chart (not a separate chart)**: `ServiceMonitor`, `PrometheusRule`, and the dashboard `ConfigMap` are *about the app*. Keeping them in `charts/app/templates/` with a `monitoring.enabled` flag means the chart describes the full surface of what the app deploys, and a release rolls both code and monitoring together. The flag default (`false`) lets the chart still install on a cluster that doesn't have the stack CRDs yet.
 - **Why a `grafana_dashboard: "1"` ConfigMap (not a Grafana provider config)**: the kube-prometheus-stack's Grafana ships a sidecar that watches for ConfigMaps with that label across all namespaces (we set `searchNamespace: ALL`). Shipping a dashboard becomes "drop a labeled ConfigMap", with no Grafana datasource provisioning, no API tokens, no UID stability problems. The dashboard JSON lives at `charts/app/dashboards/app-overview.json` and is read into the ConfigMap via `.Files.Get`.
 - **Why a div-by-zero guard on the `HighErrorRate` alert**: the alert expression is `5xx_rate / total_rate > 0.05`. On an idle service `total_rate` is 0, and `0/0` in PromQL is `NaN` — the comparison silently fails and the alert never fires. Adding `and sum(rate(http_requests_total[1m])) > 0` makes the intent explicit (only alert when there's traffic to evaluate) and avoids leaving someone wondering whether the alert is "broken" when it just hasn't seen requests.
+- **Why OpenTofu over Terraform**: drop-in OSS fork under the Linux Foundation after Hashicorp re-licensed Terraform under BUSL in 2023. The HCL is identical (every file in `infra/` works with either CLI), but the BUSL license has restrictions that don't apply to OpenTofu. For a personal project there's no reason to depend on a BUSL-licensed binary when the community fork works the same way.
+- **Why PDF-minimum scope for IaC (EC2/EIP/SG only, no IAM)**: the case study explicitly scopes Day 4.3 to *"defining the EC2, EIP, and security group with Terraform or OpenTofu"*. Codifying the OIDC provider, role, and `DeployViaSSM` policy from Day 3 was the alternative — it would add 4-5 more imports plus IAM surface to defend, with no PDF requirement. The IAM remains documented manual setup. Easy follow-up: import the IAM resources in a future iteration.
+- **Why `tofu import` instead of `tofu apply`**: the EC2, EIP, and SG already exist from Day 0; running `apply` against a fresh configuration would try to *create new* resources alongside the live ones. The correct flow is `import` — bring the live resources into Terraform's local state without changing AWS, then iterate on the `.tf` until `plan` shows no changes. A single `apply` was needed afterwards to fill in tag and description metadata; that's the only `apply` that ran.
+- **Why bind the EIP via `network_interface` on `aws_eip` instead of a separate `aws_eip_association` resource**: `aws_eip_association` has a known regression in the modern AWS provider — at import time for VPC EIPs it errors with *"with the retirement of EC2-Classic standard domain EC2 EIPs are no longer supported"*. Binding the EIP to the instance's primary network interface directly on the `aws_eip` resource (`network_interface = aws_instance.minikube.primary_network_interface_id`) avoids the broken resource and keeps the import flow to 3 resources.
+- **Why `lifecycle.ignore_changes = [ami]` on the EC2**: protects the running host. If `var.ami_id` ever drifts from the live AMI, a `tofu apply` would otherwise launch a new instance and decommission the running one — destroying minikube state, the `/opt/devops-case` checkout, the SSM agent registration, and the manual install of the kube-prometheus-stack. AMI rotation needs to be an explicit human decision, not a side effect of a tfvars change.
+- **Why `lifecycle.ignore_changes = [description, tags, tags_all]` on the SG**: the security group description is immutable in AWS (can't be modified without destroying and recreating the SG), so leaving it out of the diff loop avoids permanent "drift" noise. Tags are ignored for symmetry — after the initial alignment apply, the chart stays hands-off on metadata.
+- **Why local state, no S3 backend**: single-person project. The case study says *"local state is fine"*. In a team setting, state would live in an S3 bucket with a DynamoDB lock table to coordinate concurrent applies — but that's overhead with no benefit at this scale.
 
 Full ADRs land on Day 4 under `docs/adr/`.
 
