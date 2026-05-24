@@ -18,7 +18,10 @@ variable "ami_id" {
 variable "ssh_allowed_cidr" {
   description = "CIDR allowed to SSH in (port 22). Should be your home /32 — never 0.0.0.0/0."
   type        = string
-  sensitive   = true
+  # Not marked sensitive: the live SG already shows this CIDR in plain text, and
+  # redacting it in plan output hides the diff for the ingress block, which makes
+  # it impossible to review SG changes safely. The value is still kept out of git
+  # via the gitignored terraform.tfvars.
 }
 
 variable "key_pair_name" {

@@ -74,15 +74,12 @@ import_or_skip aws_instance.minikube "${EC2_INSTANCE_ID}"
 echo "==> Importing Elastic IP ${EIP_ALLOC}"
 import_or_skip aws_eip.minikube "${EIP_ALLOC}"
 
-echo "==> Importing EIP association"
-# The association import ID format is "<eipalloc>/<instance_id>" in v5 of
-# the provider. Older docs sometimes show "_" — try both for robustness.
-if ! ${TF_BIN} state show aws_eip_association.minikube >/dev/null 2>&1; then
-    ${TF_BIN} import aws_eip_association.minikube "${EIP_ALLOC}/${EC2_INSTANCE_ID}" \
-        || ${TF_BIN} import aws_eip_association.minikube "${EIP_ALLOC}_${EC2_INSTANCE_ID}"
-else
-    echo "    aws_eip_association.minikube already imported — skipping"
-fi
+# Note: the EIP-to-instance association is NOT a separate Terraform resource
+# here. We declare it via the `network_interface` attribute on aws_eip
+# directly, because aws_eip_association has a known import regression for
+# VPC EIPs ("with the retirement of EC2-Classic standard domain EC2 EIPs are
+# no longer supported"). Binding via network_interface avoids that path
+# entirely and keeps the import flow to 3 resources.
 
 echo "==> Importing security group ${SG_ID}"
 import_or_skip aws_security_group.minikube "${SG_ID}"

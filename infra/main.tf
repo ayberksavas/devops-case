@@ -22,9 +22,18 @@ data "aws_subnets" "default" {
 # easy code review.
 
 resource "aws_security_group" "minikube" {
-  name        = "devops-case-sg"
-  description = "Allow SSH from home + HTTP/HTTPS + minikube NodePort range"
-  vpc_id      = data.aws_vpc.default.id
+  # Auto-named by the EC2 launch wizard on Day 0 ("launch-wizard-3").
+  # Renaming this would force a destroy/recreate of the SG, which means
+  # detaching from the running EC2 — risky on a live host. Matched to live.
+  name = "launch-wizard-3"
+
+  # Description is set by the launch wizard at creation time and is immutable
+  # in AWS (can't be changed without recreating the SG). lifecycle.ignore_changes
+  # below tells Terraform to skip the comparison, so plan stays clean regardless
+  # of what the live string is.
+  description = "Managed: original description set by EC2 launch wizard"
+
+  vpc_id = data.aws_vpc.default.id
 
   ingress {
     description = "SSH from home"
@@ -35,7 +44,7 @@ resource "aws_security_group" "minikube" {
   }
 
   ingress {
-    description = "HTTP — public ingress to minikube"
+    description = "HTTP - public ingress to minikube"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -43,7 +52,7 @@ resource "aws_security_group" "minikube" {
   }
 
   ingress {
-    description = "HTTPS — public ingress to minikube"
+    description = "HTTPS - public ingress to minikube"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
@@ -51,7 +60,7 @@ resource "aws_security_group" "minikube" {
   }
 
   ingress {
-    description = "NodePort range — minikube exposes services here"
+    description = "NodePort range - minikube exposes services here"
     from_port   = 30000
     to_port     = 32767
     protocol    = "tcp"
@@ -69,6 +78,13 @@ resource "aws_security_group" "minikube" {
   tags = {
     Project = var.project_tag
     Name    = "devops-case-sg"
+  }
+
+  lifecycle {
+    # Description is immutable in AWS — skip to keep plan empty.
+    # Tags listed too so plan stays clean if the live SG isn't tagged yet;
+    # remove the `tags` line below to enforce them via apply.
+    ignore_changes = [description, tags, tags_all]
   }
 }
 
@@ -91,7 +107,7 @@ resource "aws_instance" "minikube" {
 
   tags = {
     Project = var.project_tag
-    Name    = "devops-case-minikube"
+    Name    = "devops-case"
   }
 
   # Don't recreate the instance if `var.ami_id` ever drifts from the live AMI.
@@ -103,18 +119,21 @@ resource "aws_instance" "minikube" {
   }
 }
 
-# ---- Elastic IP + association ----------------------------------------------
+# ---- Elastic IP ------------------------------------------------------------
+#
+# Association via the EIP's network_interface attribute, not a separate
+# aws_eip_association resource. The aws_eip_association resource has a known
+# regression in the modern AWS provider — it rejects VPC EIPs at import time
+# with "with the retirement of EC2-Classic standard domain EC2 EIPs are no
+# longer supported". The fix is to bind the EIP to the instance's primary
+# ENI directly here.
 
 resource "aws_eip" "minikube" {
-  domain = "vpc"
+  domain            = "vpc"
+  network_interface = aws_instance.minikube.primary_network_interface_id
 
   tags = {
     Project = var.project_tag
     Name    = "devops-case-eip"
   }
-}
-
-resource "aws_eip_association" "minikube" {
-  instance_id   = aws_instance.minikube.id
-  allocation_id = aws_eip.minikube.id
 }
