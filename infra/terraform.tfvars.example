@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and fill in the real values.
+# The real terraform.tfvars is gitignored — never commit it.
+
+# AMI ID of the *running* EC2 (Ubuntu 26.04 LTS amd64).
+# Find it with:
+#   aws ec2 describe-instances --instance-ids <i-xxx> \
+#     --query 'Reservations[].Instances[].ImageId' --output text
+ami_id = "ami-XXXXXXXXXXXXXXXXX"
+
+# Your home /32 — find with: curl -s ifconfig.me
+ssh_allowed_cidr = "1.2.3.4/32"
+
+# Override only if your key pair has a different name (default is "devops-case").
+# key_pair_name = "devops-case"
+
+# Override only if the instance profile from Day 3.4 has a different name.
+# ec2_instance_profile_name = "devops-case-ec2-ssm"
